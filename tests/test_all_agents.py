@@ -6,7 +6,7 @@ from hello_agents import (
     SimpleAgent, 
     ReActAgent, 
     ReflectionAgent, 
-    PlanAndSolveAgent,
+    PlanSolveAgent,
     HelloAgentsLLM, 
     ToolRegistry
 )
@@ -167,13 +167,13 @@ class TestReflectionAgentUsage:
         print("✅ ReflectionAgent代码生成测试通过")
 
 
-class TestPlanAndSolveAgentUsage:
-    """测试PlanAndSolveAgent用户使用场景"""
+class TestPlanSolveAgentUsage:
+    """测试PlanSolveAgent用户使用场景"""
 
     def test_basic_planning(self):
         """场景1: 基础规划"""
         llm = HelloAgentsLLM()
-        agent = PlanAndSolveAgent(
+        agent = PlanSolveAgent(
             name="规划助手",
             llm=llm
         )
@@ -183,7 +183,7 @@ class TestPlanAndSolveAgentUsage:
         print(f"\n规划结果: {result}")
         assert result is not None
         assert len(result) > 10
-        print("✅ PlanAndSolveAgent基础规划测试通过")
+        print("✅ PlanSolveAgent基础规划测试通过")
 
     def test_math_planning(self):
         """场景2: 数学问题规划"""
@@ -191,7 +191,7 @@ class TestPlanAndSolveAgentUsage:
         registry = ToolRegistry()
         registry.register_tool(CalculatorTool())
 
-        agent = PlanAndSolveAgent(
+        agent = PlanSolveAgent(
             name="数学规划助手",
             llm=llm,
             tool_registry=registry,
@@ -202,7 +202,7 @@ class TestPlanAndSolveAgentUsage:
 
         print(f"\n数学规划结果: {result}")
         assert "20" in result
-        print("✅ PlanAndSolveAgent数学规划测试通过")
+        print("✅ PlanSolveAgent数学规划测试通过")
 
 
 class TestAgentComparison:
@@ -223,10 +223,10 @@ class TestAgentComparison:
         result2 = reflection.run(task)
         print(f"\n[ReflectionAgent] {result2[:100]}...")
 
-        # PlanAndSolveAgent
-        plan = PlanAndSolveAgent("规划助手", llm)
+        # PlanSolveAgent
+        plan = PlanSolveAgent("规划助手", llm)
         result3 = plan.run(task)
-        print(f"\n[PlanAndSolveAgent] {result3[:100]}...")
+        print(f"\n[PlanSolveAgent] {result3[:100]}...")
 
         assert all([result1, result2, result3])
         print("✅ 不同Agent对比测试通过")
