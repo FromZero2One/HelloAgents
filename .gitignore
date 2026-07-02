@@ -161,5 +161,4 @@ cython_debug/
 .obsidian
 .pytest_cache
 .venv
-tests/memory/traces/
 memory/traces/
