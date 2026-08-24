@@ -192,10 +192,12 @@ class Agent(ABC):
         **kwargs
     ) -> str:
         """
-        异步执行 Agent（基础版本）
+        异步执行 Agent（真正的异步实现）
 
-        默认实现：在线程池中运行同步 run() 方法
-        子类可以覆盖此方法实现更复杂的异步逻辑（如工具并行）
+        支持：
+        - 并发工具执行（通过 max_concurrent_tools 控制）
+        - 完整的生命周期钩子
+        - 正确的错误处理
 
         Args:
             input_text: 输入文本
@@ -220,12 +222,8 @@ class Agent(ABC):
         )
 
         try:
-            # 默认实现：在线程池中运行同步 run()
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: self.run(input_text, **kwargs)
-            )
+            # 调用子类实现的异步核心逻辑
+            result = await self._arun_impl(input_text, on_step, **kwargs)
 
             # 触发完成事件
             await self._emit_event(
@@ -246,54 +244,138 @@ class Agent(ABC):
             )
             raise
 
+    async def _arun_impl(self, input_text: str, on_step: LifecycleHook = None, **kwargs) -> str:
+        """异步核心实现 - 子类必须重写此方法
+        
+        默认实现：在线程池中运行同步 run() 方法（向后兼容）
+        子类应该重写此方法实现真正的异步逻辑（如工具并行）
+        
+        Args:
+            input_text: 输入文本
+            on_step: 步骤钩子
+            **kwargs: 其他参数
+            
+        Returns:
+            执行结果
+        """
+        # 默认实现：在线程池中运行同步 run()
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.run(input_text, **kwargs)
+        )
+
     async def arun_stream(
         self,
         input_text: str,
+        on_start: LifecycleHook = None,
+        on_step: LifecycleHook = None,
+        on_finish: LifecycleHook = None,
+        on_error: LifecycleHook = None,
         **kwargs
     ) -> AsyncGenerator[AgentEvent, None]:
         """
-        流式执行 Agent（基础版本）
+        真正的流式异步执行 Agent
 
-        默认实现：执行 arun() 并返回开始/完成事件
-        子类应该覆盖此方法实现真正的流式输出
+        逐步产出 AgentEvent 事件，支持：
+        - 实时 LLM 流式输出 (LLM_CHUNK)
+        - 工具调用进度 (TOOL_CALL, TOOL_RESULT)
+        - 步骤级事件 (STEP_START, STEP_FINISH)
+        - 生命周期事件 (AGENT_START, AGENT_FINISH, AGENT_ERROR)
 
         Args:
             input_text: 输入文本
+            on_start: 开始钩子
+            on_step: 步骤钩子
+            on_finish: 完成钩子
+            on_error: 错误钩子
             **kwargs: 其他参数
 
         Yields:
-            AgentEvent: 生命周期事件
+            AgentEvent: 生命周期事件流
 
         Example:
             >>> async for event in agent.arun_stream("Hello"):
             ...     print(event.type, event.data)
         """
-        # 开始事件
-        yield AgentEvent.create(
+        # 发送开始事件
+        start_event = AgentEvent.create(
             EventType.AGENT_START,
             self.name,
             input_text=input_text
         )
+        yield start_event
+        
+        if on_start:
+            try:
+                await on_start(start_event)
+            except Exception:
+                pass
 
-        # 执行
         try:
-            result = await self.arun(input_text, **kwargs)
+            # 调用子类实现的流式核心逻辑
+            async for event in self._arun_stream_impl(input_text, on_step, **kwargs):
+                yield event
+                if on_step and event.type in (EventType.STEP_START, EventType.STEP_FINISH, EventType.TOOL_CALL, EventType.TOOL_RESULT, EventType.LLM_CHUNK):
+                    try:
+                        await on_step(event)
+                    except Exception:
+                        pass
 
-            # 完成事件
-            yield AgentEvent.create(
+            # 发送完成事件
+            finish_event = AgentEvent.create(
                 EventType.AGENT_FINISH,
                 self.name,
-                result=result
+                result=event.data.get("result", "") if hasattr(event, 'data') else ""
             )
+            yield finish_event
+            
+            if on_finish:
+                try:
+                    await on_finish(finish_event)
+                except Exception:
+                    pass
+
         except Exception as e:
-            # 错误事件
-            yield AgentEvent.create(
+            # 发送错误事件
+            error_event = AgentEvent.create(
                 EventType.AGENT_ERROR,
                 self.name,
                 error=str(e),
                 error_type=type(e).__name__
             )
+            yield error_event
+            
+            if on_error:
+                try:
+                    await on_error(error_event)
+                except Exception:
+                    pass
             raise
+
+    async def _arun_stream_impl(self, input_text: str, on_step: LifecycleHook = None, **kwargs) -> AsyncGenerator[AgentEvent, None]:
+        """流式异步核心实现 - 子类必须重写此方法
+        
+        默认实现：运行 _arun_impl 并产出开始/完成事件
+        子类应该重写此方法实现真正的流式输出（逐 token、工具流式等）
+        
+        Args:
+            input_text: 输入文本
+            on_step: 步骤钩子
+            **kwargs: 其他参数
+            
+        Yields:
+            AgentEvent: 生命周期事件流
+        """
+        # 默认实现：执行 _arun_impl 并产出事件
+        result = await self._arun_impl(input_text, on_step, **kwargs)
+        
+        # 产出完成事件（包含结果）
+        yield AgentEvent.create(
+            EventType.AGENT_FINISH,
+            self.name,
+            result=result
+        )
 
     async def _emit_event(
         self,

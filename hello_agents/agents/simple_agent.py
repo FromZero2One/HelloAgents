@@ -369,7 +369,7 @@ class SimpleAgent(Agent):
         **kwargs
     ) -> AsyncGenerator[StreamEvent, None]:
         """
-        SimpleAgent 真正的流式执行
+        SimpleAgent 真正的流式执行（兼容旧接口）
 
         实时返回 LLM 输出的每个文本块
 
@@ -434,3 +434,457 @@ class SimpleAgent(Agent):
                 error_type=type(e).__name__
             )
             raise
+
+    # ==================== 新异步接口实现 ====================
+
+    async def _arun_impl(self, input_text: str, on_step: LifecycleHook = None, **kwargs) -> str:
+        """SimpleAgent 异步核心实现（支持工具并行）"""
+        from datetime import datetime
+        from hello_agents.observability import TraceLogger
+
+        session_start_time = datetime.now()
+
+        # 为每次 run 创建新的 TraceLogger
+        trace_logger = None
+        if self.config.trace_enabled:
+            trace_logger = TraceLogger(
+                output_dir=self.config.trace_dir,
+                sanitize=self.config.trace_sanitize,
+                html_include_raw_response=self.config.trace_html_include_raw_response
+            )
+            trace_logger.log_event(
+                "session_start",
+                {
+                    "agent_name": self.name,
+                    "agent_type": self.__class__.__name__,
+                }
+            )
+
+        # 构建消息列表
+        messages = self._build_messages(input_text)
+
+        # 记录用户消息
+        if trace_logger:
+            trace_logger.log_event(
+                "message_written",
+                {"role": "user", "content": input_text}
+            )
+
+        # 如果没有启用工具调用，直接返回 LLM 响应
+        if not self.enable_tool_calling or not self.tool_registry:
+            llm_response = await self.llm.ainvoke(messages, **kwargs)
+            response_text = llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
+
+            # 保存到历史记录
+            self.add_message(Message(input_text, "user"))
+            self.add_message(Message(response_text, "assistant"))
+
+            if trace_logger:
+                duration = (datetime.now() - session_start_time).total_seconds()
+                trace_logger.log_event(
+                    "session_end",
+                    {
+                        "duration": duration,
+                        "final_answer": response_text,
+                        "status": "success",
+                        "usage": llm_response.usage if hasattr(llm_response, 'usage') else {},
+                        "latency_ms": llm_response.latency_ms if hasattr(llm_response, 'latency_ms') else 0
+                    }
+                )
+                trace_logger.finalize()
+
+            return response_text
+
+        # 启用工具调用模式（异步并行）
+        tool_plugin = self._get_plugin("tool")
+        tool_schemas = self._build_tool_schemas()
+
+        current_iteration = 0
+        final_response = ""
+
+        while current_iteration < self.max_tool_iterations:
+            current_iteration += 1
+
+            # 发送步骤开始事件
+            if on_step:
+                step_event = AgentEvent.create(EventType.STEP_START, self.name, step=current_iteration)
+                try:
+                    await on_step(step_event)
+                except Exception:
+                    pass
+
+            # 调用 LLM（Function Calling）
+            try:
+                response = await self.llm.ainvoke_with_tools(
+                    messages=messages,
+                    tools=tool_schemas,
+                    tool_choice="auto",
+                    **kwargs
+                )
+            except Exception as e:
+                print(f"❌ LLM 调用失败: {e}")
+                if trace_logger:
+                    trace_logger.log_event(
+                        "error",
+                        {"error_type": "LLM_ERROR", "message": str(e)},
+                        step=current_iteration
+                    )
+                break
+
+            # 获取响应消息
+            tool_calls = response.tool_calls
+            if not tool_calls:
+                # 没有工具调用，直接返回文本响应
+                final_response = response.content or "抱歉，我无法回答这个问题。"
+                break
+
+            # 将助手消息添加到历史
+            messages.append({
+                "role": "assistant",
+                "content": response.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments
+                        }
+                    }
+                    for tc in tool_calls
+                ]
+            })
+
+            # 记录模型输出
+            if trace_logger:
+                usage = response.usage
+                trace_logger.log_event(
+                    "model_output",
+                    {
+                        "content": response.content,
+                        "tool_calls": len(response.tool_calls) if response.tool_calls else 0,
+                        "usage": {
+                            "prompt_tokens": usage.get("prompt_tokens", 0) if usage else 0,
+                            "completion_tokens": usage.get("completion_tokens", 0) if usage else 0,
+                            "total_tokens": usage.get("total_tokens", 0) if usage else 0
+                        }
+                    },
+                    step=current_iteration
+                )
+
+            # 发送工具调用事件
+            if on_step:
+                for tc in tool_calls:
+                    tool_event = AgentEvent.create(EventType.TOOL_CALL, self.name, 
+                        tool_name=tc.name, tool_args=tc.arguments, step=current_iteration)
+                    try:
+                        await on_step(tool_event)
+                    except Exception:
+                        pass
+
+            # 并行执行所有工具调用
+            if tool_plugin:
+                tool_calls_list = [
+                    {"name": tc.name, "arguments": json.loads(tc.arguments), "id": tc.id}
+                    for tc in tool_calls
+                ]
+                
+                tool_results = await tool_plugin.aexecute_tool_calls_parallel(tool_calls_list)
+                
+                for i, (tool_call, result) in enumerate(zip(tool_calls, tool_results)):
+                    tool_name = tool_call.name
+                    tool_call_id = tool_call.id
+
+                    # 记录工具调用
+                    if trace_logger:
+                        trace_logger.log_event(
+                            "tool_call",
+                            {
+                                "tool_name": tool_name,
+                                "tool_call_id": tool_call_id,
+                                "args": tool_calls_list[i]["arguments"]
+                            },
+                            step=current_iteration
+                        )
+
+                    # 发送工具结果事件
+                    if on_step:
+                        tool_result_event = AgentEvent.create(EventType.TOOL_RESULT, self.name,
+                            tool_name=tool_name, tool_result=result.text, step=current_iteration)
+                        try:
+                            await on_step(tool_result_event)
+                        except Exception:
+                            pass
+
+                    # 记录工具结果
+                    if trace_logger:
+                        trace_logger.log_event(
+                            "tool_result",
+                            {
+                                "tool_name": tool_name,
+                                "tool_call_id": tool_call_id,
+                                "result": result.text
+                            },
+                            step=current_iteration
+                        )
+
+                    # 添加工具结果到消息
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": result.text
+                    })
+
+            # 发送步骤完成事件
+            if on_step:
+                step_finish_event = AgentEvent.create(EventType.STEP_FINISH, self.name, step=current_iteration)
+                try:
+                    await on_step(step_finish_event)
+                except Exception:
+                    pass
+
+        # 如果超过最大迭代次数，获取最后一次回答
+        if current_iteration >= self.max_tool_iterations and not final_response:
+            llm_response = await self.llm.ainvoke(messages, **kwargs)
+            final_response = llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
+
+        # 保存到历史记录
+        self.add_message(Message(input_text, "user"))
+        self.add_message(Message(final_response, "assistant"))
+
+        if trace_logger:
+            duration = (datetime.now() - session_start_time).total_seconds()
+            trace_logger.log_event(
+                "session_end",
+                {
+                    "duration": duration,
+                    "total_steps": current_iteration,
+                    "final_answer": final_response,
+                    "status": "success"
+                }
+            )
+            trace_logger.finalize()
+
+        return final_response
+
+    async def _arun_stream_impl(self, input_text: str, on_step: LifecycleHook = None, **kwargs) -> AsyncGenerator[AgentEvent, None]:
+        """SimpleAgent 真正的流式异步实现"""
+        from datetime import datetime
+        from hello_agents.observability import TraceLogger
+
+        session_start_time = datetime.now()
+
+        # 为每次 run 创建新的 TraceLogger
+        trace_logger = None
+        if self.config.trace_enabled:
+            trace_logger = TraceLogger(
+                output_dir=self.config.trace_dir,
+                sanitize=self.config.trace_sanitize,
+                html_include_raw_response=self.config.trace_html_include_raw_response
+            )
+            trace_logger.log_event(
+                "session_start",
+                {
+                    "agent_name": self.name,
+                    "agent_type": self.__class__.__name__,
+                }
+            )
+
+        # 构建消息列表
+        messages = self._build_messages(input_text)
+
+        # 记录用户消息
+        if trace_logger:
+            trace_logger.log_event(
+                "message_written",
+                {"role": "user", "content": input_text}
+            )
+
+        # 如果没有启用工具调用，直接流式返回 LLM 响应
+        if not self.enable_tool_calling or not self.tool_registry:
+            full_response = ""
+            async for chunk in self.llm.astream_invoke(messages, **kwargs):
+                full_response += chunk
+
+                # 发送 LLM 输出块
+                yield AgentEvent.create(
+                    EventType.LLM_CHUNK,
+                    self.name,
+                    chunk=chunk
+                )
+
+            # 保存到历史
+            self.add_message(Message(input_text, "user"))
+            self.add_message(Message(full_response, "assistant"))
+
+            if trace_logger:
+                duration = (datetime.now() - session_start_time).total_seconds()
+                trace_logger.log_event(
+                    "session_end",
+                    {
+                        "duration": duration,
+                        "final_answer": full_response,
+                        "status": "success",
+                    }
+                )
+                trace_logger.finalize()
+
+            yield AgentEvent.create(
+                EventType.AGENT_FINISH,
+                self.name,
+                result=full_response
+            )
+            return
+
+        # 启用工具调用模式（流式 + 工具并行）
+        tool_plugin = self._get_plugin("tool")
+        tool_schemas = self._build_tool_schemas()
+
+        current_iteration = 0
+        final_response = ""
+
+        while current_iteration < self.max_tool_iterations:
+            current_iteration += 1
+
+            # 发送步骤开始
+            yield AgentEvent.create(EventType.STEP_START, self.name, step=current_iteration)
+
+            # 调用 LLM（Function Calling - 非流式获取工具调用）
+            try:
+                response = await self.llm.ainvoke_with_tools(
+                    messages=messages,
+                    tools=tool_schemas,
+                    tool_choice="auto",
+                    **kwargs
+                )
+            except Exception as e:
+                yield AgentEvent.create(
+                    EventType.AGENT_ERROR,
+                    self.name,
+                    error=str(e),
+                    error_type=type(e).__name__
+                )
+                return
+
+            tool_calls = response.tool_calls
+            if not tool_calls:
+                # 没有工具调用，流式获取最终响应
+                async for chunk in self.llm.astream_invoke(messages, **kwargs):
+                    final_response += chunk
+                    yield AgentEvent.create(
+                        EventType.LLM_CHUNK,
+                        self.name,
+                        chunk=chunk
+                    )
+                break
+
+            # 将助手消息添加到历史
+            messages.append({
+                "role": "assistant",
+                "content": response.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments
+                        }
+                    }
+                    for tc in tool_calls
+                ]
+            })
+
+            # 记录模型输出
+            if trace_logger:
+                usage = response.usage
+                trace_logger.log_event(
+                    "model_output",
+                    {
+                        "content": response.content,
+                        "tool_calls": len(response.tool_calls) if response.tool_calls else 0,
+                        "usage": {
+                            "prompt_tokens": usage.get("prompt_tokens", 0) if usage else 0,
+                            "completion_tokens": usage.get("completion_tokens", 0) if usage else 0,
+                            "total_tokens": usage.get("total_tokens", 0) if usage else 0
+                        }
+                    },
+                    step=current_iteration
+                )
+
+            # 发送工具调用事件
+            for tc in tool_calls:
+                yield AgentEvent.create(EventType.TOOL_CALL, self.name,
+                    tool_name=tc.name, tool_args=tc.arguments, step=current_iteration)
+
+            # 并行执行所有工具调用
+            if tool_plugin:
+                tool_calls_list = [
+                    {"name": tc.name, "arguments": json.loads(tc.arguments), "id": tc.id}
+                    for tc in tool_calls
+                ]
+                
+                tool_results = await tool_plugin.aexecute_tool_calls_parallel(tool_calls_list)
+                
+                for i, (tool_call, result) in enumerate(zip(tool_calls, tool_results)):
+                    tool_name = tool_call.name
+                    tool_call_id = tool_call.id
+
+                    # 发送工具结果事件
+                    yield AgentEvent.create(EventType.TOOL_RESULT, self.name,
+                        tool_name=tool_name, tool_result=result.text, step=current_iteration)
+
+                    # 记录工具结果
+                    if trace_logger:
+                        trace_logger.log_event(
+                            "tool_result",
+                            {
+                                "tool_name": tool_name,
+                                "tool_call_id": tool_call_id,
+                                "result": result.text
+                            },
+                            step=current_iteration
+                        )
+
+                    # 添加工具结果到消息
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": result.text
+                    })
+
+            # 发送步骤完成
+            yield AgentEvent.create(EventType.STEP_FINISH, self.name, step=current_iteration)
+
+        # 如果超过最大迭代次数，获取最后一次回答
+        if current_iteration >= self.max_tool_iterations and not final_response:
+            async for chunk in self.llm.astream_invoke(messages, **kwargs):
+                final_response += chunk
+                yield AgentEvent.create(
+                    EventType.LLM_CHUNK,
+                    self.name,
+                    chunk=chunk
+                )
+
+        # 保存到历史记录
+        self.add_message(Message(input_text, "user"))
+        self.add_message(Message(final_response, "assistant"))
+
+        if trace_logger:
+            duration = (datetime.now() - session_start_time).total_seconds()
+            trace_logger.log_event(
+                "session_end",
+                {
+                    "duration": duration,
+                    "total_steps": current_iteration,
+                    "final_answer": final_response,
+                    "status": "success"
+                }
+            )
+            trace_logger.finalize()
+
+        yield AgentEvent.create(
+            EventType.AGENT_FINISH,
+            self.name,
+            result=final_response
+        )

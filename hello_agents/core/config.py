@@ -1,7 +1,7 @@
 """配置管理"""
 
 import os
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from pydantic import BaseModel
 
 class Config(BaseModel):
@@ -88,6 +88,17 @@ class Config(BaseModel):
     stream_include_thinking: bool = True  # 是否包含思考过程
     stream_include_tool_calls: bool = True  # 是否包含工具调用
 
+    # MCP (Model Context Protocol) 配置
+    mcp_servers: List[Dict[str, Any]] = []  # MCP 服务器配置列表
+    # 示例：
+    # mcp_servers = [
+    #     {
+    #         "name": "github",
+    #         "command": ["npx", "-y", "@modelcontextprotocol/server-github"],
+    #         "env": {"GITHUB_TOKEN": "your_token"}
+    #     }
+    # ]
+
     @classmethod
     def from_env(cls) -> "Config":
         """从环境变量创建配置"""
@@ -101,3 +112,7 @@ class Config(BaseModel):
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return self.model_dump()
+
+
+# 重建模型以解决前向引用问题
+Config.model_rebuild()

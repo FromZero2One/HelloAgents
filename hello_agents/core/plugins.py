@@ -215,10 +215,12 @@ def create_default_plugins(config: 'Config', tool_registry: Optional['ToolRegist
     from .plugins_subagent import SubAgentPlugin
     from .plugins_todo import TodoPlugin
     from .plugins_devlog import DevLogPlugin
+    from .plugins_mcp import MCPPlugin
     
     plugins = [
         HistoryPlugin(config),
         TokenCounterPlugin(config),
+        MCPPlugin(config),  # MCP 优先，以便注册工具
         ToolPlugin(config, tool_registry),
         TruncatorPlugin(config),
         TracePlugin(config),
@@ -245,6 +247,7 @@ def _is_plugin_enabled(plugin_name: str, config: 'Config', tool_registry: Option
     mapping = {
         "history": True,
         "token_counter": True,
+        "mcp": bool(getattr(config, 'mcp_servers', None)),  # 有 MCP 配置才启用
         "tool": tool_registry is not None,
         "truncator": True,
         "trace": config.trace_enabled,
