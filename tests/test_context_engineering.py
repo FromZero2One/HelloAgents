@@ -324,7 +324,8 @@ class TestAgentIntegration:
         from hello_agents import SimpleAgent, HelloAgentsLLM
 
         llm = HelloAgentsLLM()
-        config = Config(min_retain_rounds=2)
+        # 使用极小的上下文窗口，确保测试中能触发压缩
+        config = Config(min_retain_rounds=2, context_window=100, compression_threshold=0.5)
         agent = SimpleAgent("测试助手", llm, config=config)
 
         # 添加 10 轮对话（超过阈值）
@@ -361,7 +362,9 @@ class TestAgentIntegration:
         llm = HelloAgentsLLM()
         config = Config(
             min_retain_rounds=3,  # 保留最近 3 轮
-            enable_smart_compression=False  # 使用简单摘要
+            enable_smart_compression=False,  # 使用简单摘要
+            context_window=500,  # 较小的上下文窗口，确保触发压缩
+            compression_threshold=0.5
         )
         agent = SimpleAgent("测试助手", llm, config=config)
 
