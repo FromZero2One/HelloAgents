@@ -7,11 +7,17 @@ from .message import Message
 from .llm import HelloAgentsLLM
 from .config import Config
 from .lifecycle import AgentEvent, EventType, LifecycleHook, ExecutionContext
+from .plugins import PluginManager, PluginContext, create_default_plugins
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolRegistry
     from ..observability.trace_logger import TraceLogger
     from ..tools.tool_filter import ToolFilter
+    from ..context.history import HistoryManager
+    from ..context.token_counter import TokenCounter
+    from ..context.truncator import ObservationTruncator
+    from ..core.session_store import SessionStore
+    from ..skills.loader import SkillLoader
 
 
 class Agent(ABC):
@@ -45,102 +51,129 @@ class Agent(ABC):
         # 工具注册表（可选）
         self.tool_registry = tool_registry
 
-        # 新增：上下文工程组件
-        from hello_agents.context.history import HistoryManager
-        from hello_agents.context.truncator import ObservationTruncator
+        # 插件系统初始化
+        self._plugin_manager = PluginManager()
+        self._init_plugins()
 
-        self.history_manager = HistoryManager(
-            min_retain_rounds=self.config.min_retain_rounds,
-            compression_threshold=self.config.compression_threshold
+        # 向后兼容属性（代理到插件）
+        self._init_compat_properties()
+
+    def _init_plugins(self) -> None:
+        """初始化插件系统"""
+        # 创建插件上下文
+        context = PluginContext(
+            agent=self,
+            config=self.config,
+            llm=self.llm,
+            tool_registry=self.tool_registry
         )
+        
+        # 创建并注册默认插件
+        plugins = create_default_plugins(self.config, self.tool_registry)
+        self._plugin_manager.register_many(plugins)
+        
+        # 初始化所有插件
+        self._plugin_manager.initialize_all(context)
 
-        self.truncator = ObservationTruncator(
-            max_lines=self.config.tool_output_max_lines,
-            max_bytes=self.config.tool_output_max_bytes,
-            truncate_direction=self.config.tool_output_truncate_direction,
-            output_dir=self.config.tool_output_dir
-        )
+    def _init_compat_properties(self) -> None:
+        """初始化向后兼容属性（代理到插件）"""
+        # 这些属性将通过 property 动态获取
+        pass
 
-        # 新增：Token 计数器（缓存 + 增量计算）
-        from ..context.token_counter import TokenCounter
-        self.token_counter = TokenCounter(model=self.llm.model)
-        self._history_token_count = 0  # 缓存历史 Token 数
+    @property
+    def _plugin_manager(self) -> PluginManager:
+        return self.__dict__.get('_plugin_manager')
 
-        # 新增：可观测性组件
-        from hello_agents.observability import TraceLogger
+    @_plugin_manager.setter
+    def _plugin_manager(self, value: PluginManager):
+        self.__dict__['_plugin_manager'] = value
 
-        self.trace_logger: Optional[TraceLogger] = None
-        if self.config.trace_enabled:
-            self.trace_logger = TraceLogger(
-                output_dir=self.config.trace_dir,
-                sanitize=self.config.trace_sanitize,
-                html_include_raw_response=self.config.trace_html_include_raw_response
-            )
-            # 记录会话开始
-            self.trace_logger.log_event(
-                "session_start",
-                {
-                    "agent_name": self.name,
-                    "agent_type": self.__class__.__name__,
-                    "config": self.config.model_dump()
-                }
-            )
+    def _get_plugin(self, name: str):
+        """获取插件实例"""
+        return self._plugin_manager.get_plugin(name)
 
-        # 新增：Skills 知识外化组件
-        from pathlib import Path
-        from hello_agents.skills import SkillLoader
+    @property
+    def history_manager(self):
+        """向后兼容：历史管理器"""
+        plugin = self._get_plugin("history")
+        return plugin.history_manager if plugin else None
 
-        self.skill_loader: Optional[SkillLoader] = None
-        if self.config.skills_enabled:
-            skills_path = Path(self.config.skills_dir)
-            self.skill_loader = SkillLoader(skills_dir=skills_path)
+    @property
+    def token_counter(self):
+        """向后兼容：Token 计数器"""
+        plugin = self._get_plugin("token_counter")
+        return plugin.token_counter if plugin else None
 
-            # 自动注册 SkillTool
-            if self.config.skills_auto_register and self.tool_registry:
-                from hello_agents.tools.builtin.skill_tool import SkillTool
-                skill_tool = SkillTool(skill_loader=self.skill_loader)
-                self.tool_registry.register_tool(skill_tool)
+    @property
+    def truncator(self):
+        """向后兼容：截断器"""
+        plugin = self._get_plugin("truncator")
+        return plugin.truncator if plugin else None
 
-        # 新增：会话持久化组件
-        from datetime import datetime
-        from .session_store import SessionStore
+    @property
+    def trace_logger(self):
+        """向后兼容：追踪记录器"""
+        plugin = self._get_plugin("trace")
+        return plugin.trace_logger if plugin else None
 
-        self.session_store: Optional[SessionStore] = None
-        if self.config.session_enabled:
-            self.session_store = SessionStore(session_dir=self.config.session_dir)
+    @property
+    def skill_loader(self):
+        """向后兼容：技能加载器"""
+        plugin = self._get_plugin("skill")
+        return plugin.skill_loader if plugin else None
 
-        # 会话元数据（用于保存）
-        self._session_metadata = {
-            "created_at": datetime.now().isoformat(),
-            "total_tokens": 0,
-            "total_steps": 0,
-            "duration_seconds": 0
-        }
-        self._start_time = datetime.now()
+    @property
+    def session_store(self):
+        """向后兼容：会话存储"""
+        plugin = self._get_plugin("session")
+        return plugin.session_store if plugin else None
 
-        # 新增：子代理机制组件
-        if self.config.subagent_enabled and self.tool_registry:
-            self._register_task_tool()
+    @property
+    def _session_metadata(self):
+        """向后兼容：会话元数据"""
+        return self._plugin_manager.context.session_metadata if self._plugin_manager else {}
 
-        # 新增：TodoWrite 进度管理组件
-        if self.config.todowrite_enabled and self.tool_registry:
-            self._register_todowrite_tool()
+    @_session_metadata.setter
+    def _session_metadata(self, value):
+        if self._plugin_manager:
+            self._plugin_manager.context.session_metadata = value
 
-        # 新增：DevLog 开发日志组件
-        if self.config.devlog_enabled and self.tool_registry:
-            self._register_devlog_tool()
+    @property
+    def _start_time(self):
+        """向后兼容：开始时间"""
+        return self._plugin_manager.context.start_time if self._plugin_manager else None
+
+    @_start_time.setter
+    def _start_time(self, value):
+        if self._plugin_manager:
+            self._plugin_manager.context.start_time = value
+
+    @property
+    def _history_token_count(self) -> int:
+        """向后兼容：历史 Token 计数（代理到 TokenCounterPlugin）"""
+        token_plugin = self._get_plugin("token_counter")
+        return token_plugin.total_tokens if token_plugin else 0
+
+    @_history_token_count.setter
+    def _history_token_count(self, value: int):
+        token_plugin = self._get_plugin("token_counter")
+        if token_plugin:
+            token_plugin._total_tokens = value
 
     @property
     def _history(self) -> List[Message]:
         """向后兼容：通过 property 代理到 HistoryManager"""
-        return self.history_manager.get_history()
+        if self.history_manager:
+            return self.history_manager.get_history()
+        return []
 
     @_history.setter
     def _history(self, value: List[Message]):
         """向后兼容：允许直接设置历史"""
-        self.history_manager.clear()
-        for msg in value:
-            self.history_manager.append(msg)
+        if self.history_manager:
+            self.history_manager.clear()
+            for msg in value:
+                self.history_manager.append(msg)
 
     @abstractmethod
     def run(self, input_text: str, **kwargs) -> str:
@@ -298,108 +331,54 @@ class Agent(ABC):
                     )
 
     def add_message(self, message: Message):
-        """添加消息到历史记录
-
-        自动检查是否需要压缩历史
-        """
-        self.history_manager.append(message)
-
-        # 增量更新 Token 计数
-        new_tokens = self.token_counter.count_message(message)
-        self._history_token_count += new_tokens
-
-        # 检查是否需要压缩
-        if self._should_compress():
-            self._compress_history()
-
-        # 自动保存（如果启用）
-        if self.config.auto_save_enabled and self.session_store:
-            history_len = len(self.history_manager.get_history())
-            if history_len % self.config.auto_save_interval == 0:
-                self._auto_save()
+        """添加消息到历史记录（代理到 HistoryPlugin）"""
+        history_plugin = self._get_plugin("history")
+        if history_plugin:
+            history_plugin.add_message(message)
 
     def clear_history(self):
-        """清空历史记录"""
-        self.history_manager.clear()
-        # 重置 Token 计数
-        self._history_token_count = 0
-        self.token_counter.clear_cache()
+        """清空历史记录（代理到 HistoryPlugin + TokenCounterPlugin）"""
+        history_plugin = self._get_plugin("history")
+        if history_plugin:
+            history_plugin.clear_history()
+        token_plugin = self._get_plugin("token_counter")
+        if token_plugin:
+            token_plugin.reset()
 
     def get_history(self) -> List[Message]:
         """获取历史记录"""
-        return self.history_manager.get_history()
+        if self.history_manager:
+            return self.history_manager.get_history()
+        return []
 
     def _should_compress(self) -> bool:
-        """判断是否需要压缩历史
-
-        基于缓存的 Token 数判断（高性能）
-        使用增量计算，避免重复遍历历史
-
-        Returns:
-            是否需要压缩
-        """
-        threshold = int(self.config.context_window * self.config.compression_threshold)
-        return self._history_token_count > threshold
+        """判断是否需要压缩历史（代理到 HistoryPlugin）"""
+        history_plugin = self._get_plugin("history")
+        if history_plugin:
+            return history_plugin._should_compress()
+        return False
 
     def _compress_history(self):
-        """压缩历史
-
-        默认使用简单摘要策略
-        如果启用 enable_smart_compression，子类可以重写此方法调用 LLM 生成智能摘要
-        """
-        history = self.history_manager.get_history()
-
-        if self.config.enable_smart_compression:
-            # 智能摘要（需要子类实现）
-            summary = self._generate_smart_summary(history)
-        else:
-            # 简单摘要
-            summary = self._generate_simple_summary(history)
-
-        self.history_manager.compress(summary)
-
-        # 重新计算 Token 数（压缩后）
-        new_history = self.history_manager.get_history()
-        self._history_token_count = self.token_counter.count_messages(new_history)
+        """压缩历史（代理到 HistoryPlugin）"""
+        history_plugin = self._get_plugin("history")
+        if history_plugin:
+            history_plugin._compress_history()
 
     def _generate_simple_summary(self, history: List[Message]) -> str:
-        """生成简单摘要（统计信息）
-
-        Args:
-            history: 历史消息列表
-
-        Returns:
-            摘要文本
-        """
-        rounds = self.history_manager.estimate_rounds()
-        user_msgs = sum(1 for msg in history if msg.role == "user")
-        assistant_msgs = sum(1 for msg in history if msg.role == "assistant")
-
-        return f"""此会话包含 {rounds} 轮对话：
-- 用户消息：{user_msgs} 条
-- 助手消息：{assistant_msgs} 条
-- 总消息数：{len(history)} 条
-
-（历史已压缩，保留最近 {self.config.min_retain_rounds} 轮完整对话）"""
+        """生成简单摘要（代理到 HistoryPlugin）"""
+        history_plugin = self._get_plugin("history")
+        if history_plugin:
+            return history_plugin._generate_simple_summary(history)
+        return ""
 
     def _generate_smart_summary(self, history: List[Message]) -> str:
-        """生成智能摘要（调用 LLM）
-
-        使用轻量 LLM 生成结构化摘要，保留关键信息：
-        - 任务目标
-        - 关键决策
-        - 已完成工作
-        - 待处理事项
-        - 重要发现
-
-        Args:
-            history: 历史消息列表
-
-        Returns:
-            摘要文本
-        """
+        """生成智能摘要（内部实现，避免循环引用）"""
         # 1. 提取要压缩的历史片段
-        boundaries = self.history_manager.find_round_boundaries()
+        if self.history_manager:
+            boundaries = self.history_manager.find_round_boundaries()
+        else:
+            return self._generate_simple_summary(history)
+        
         if len(boundaries) <= self.config.min_retain_rounds:
             return self._generate_simple_summary(history)
 
@@ -455,34 +434,18 @@ class Agent(ABC):
             return self._generate_simple_summary(history)
 
     def _format_history_for_summary(self, history: List[Message]) -> str:
-        """格式化历史消息用于摘要生成
-
-        Args:
-            history: 历史消息列表
-
-        Returns:
-            格式化后的历史文本
-        """
-        formatted_lines = []
-        for msg in history:
-            # 截断过长消息（避免摘要 Prompt 过大）
-            content = msg.content[:500] if len(msg.content) > 500 else msg.content
-            formatted_lines.append(f"[{msg.role}]: {content}")
-
-        return "\n\n".join(formatted_lines)
+        """格式化历史消息用于摘要生成"""
+        history_plugin = self._get_plugin("history")
+        if history_plugin and hasattr(history_plugin, '_format_history_for_summary'):
+            return history_plugin._format_history_for_summary(history)
+        return ""
 
     def _get_summary_llm(self):
-        """获取摘要专用 LLM（轻量模型）
-
-        使用独立的轻量 LLM 实例，节省成本
-
-        Returns:
-            HelloAgentsLLM 实例
-        """
+        """获取摘要专用 LLM（轻量模型）"""
+        # 保持原有逻辑，因为它依赖 Agent 实例
         if not hasattr(self, '_summary_llm'):
             from ..core.llm import HelloAgentsLLM
 
-            # 使用配置中的轻量模型
             provider = self.config.summary_llm_provider
             model = self.config.summary_llm_model
 
@@ -704,126 +667,35 @@ class Agent(ABC):
     # ==================== 会话持久化能力 ====================
 
     def _auto_save(self):
-        """自动保存会话（静默失败）"""
-        if not self.session_store:
-            return
-
-        try:
-            self.session_store.save(
-                agent_config=self._get_agent_config(),
-                history=self.history_manager.get_history(),
-                tool_schema_hash=self._compute_tool_schema_hash(),
-                read_cache=self._get_read_cache(),
-                metadata=self._session_metadata,
-                session_name="session-auto"
-            )
-        except Exception as e:
-            # 自动保存失败不影响主流程
-            if self.config.debug:
-                print(f"⚠️ 自动保存失败: {e}")
+        """自动保存会话（静默失败，代理到 SessionPlugin）"""
+        session_plugin = self._get_plugin("session")
+        if session_plugin:
+            session_plugin.maybe_auto_save()
 
     def save_session(self, session_name: str) -> str:
-        """手动保存会话
-
-        Args:
-            session_name: 会话名称（不含 .json 后缀）
-
-        Returns:
-            保存的文件路径
-
-        Raises:
-            RuntimeError: 会话持久化未启用
-        """
-        if not self.session_store:
-            raise RuntimeError("会话持久化未启用，请在 Config 中设置 session_enabled=True")
-
-        # 更新元数据
-        from datetime import datetime
-        self._session_metadata["duration_seconds"] = (datetime.now() - self._start_time).total_seconds()
-
-        filepath = self.session_store.save(
-            agent_config=self._get_agent_config(),
-            history=self.history_manager.get_history(),
-            tool_schema_hash=self._compute_tool_schema_hash(),
-            read_cache=self._get_read_cache(),
-            metadata=self._session_metadata,
-            session_name=session_name
-        )
-
-        return filepath
+        """手动保存会话（代理到 SessionPlugin）"""
+        session_plugin = self._get_plugin("session")
+        if session_plugin:
+            return session_plugin.save_session(session_name)
+        raise RuntimeError("会话持久化未启用，请在 Config 中设置 session_enabled=True")
 
     def load_session(self, filepath: str, check_consistency: bool = True) -> None:
-        """加载会话
-
-        Args:
-            filepath: 会话文件路径
-            check_consistency: 是否检查环境一致性
-
-        Raises:
-            RuntimeError: 会话持久化未启用
-            FileNotFoundError: 文件不存在
-        """
-        if not self.session_store:
+        """加载会话（代理到 SessionPlugin）"""
+        session_plugin = self._get_plugin("session")
+        if session_plugin:
+            session_plugin.load_session(filepath, check_consistency)
+        else:
             raise RuntimeError("会话持久化未启用，请在 Config 中设置 session_enabled=True")
 
-        # 加载会话数据
-        session_data = self.session_store.load(filepath)
-
-        # 环境一致性检查
-        if check_consistency:
-            # 检查配置一致性
-            config_check = self.session_store.check_config_consistency(
-                saved_config=session_data.get("agent_config", {}),
-                current_config=self._get_agent_config()
-            )
-
-            if not config_check["consistent"]:
-                print("⚠️ 环境配置不一致：")
-                for warning in config_check["warnings"]:
-                    print(f"  - {warning}")
-
-            # 检查工具 Schema 一致性
-            tool_check = self.session_store.check_tool_schema_consistency(
-                saved_hash=session_data.get("tool_schema_hash", ""),
-                current_hash=self._compute_tool_schema_hash()
-            )
-
-            if tool_check["changed"]:
-                print(f"⚠️ 工具定义已变化")
-                print(f"  建议：{tool_check['recommendation']}")
-
-        # 恢复历史
-        from .message import Message
-        self.history_manager.clear()
-        for msg_data in session_data.get("history", []):
-            self.history_manager.append(Message.from_dict(msg_data))
-
-        # 恢复元数据
-        self._session_metadata = session_data.get("metadata", {})
-
-        # 恢复 Read 工具缓存
-        if self.tool_registry and session_data.get("read_cache"):
-            self.tool_registry.read_metadata_cache = session_data["read_cache"]
-
-        print(f"✅ 会话已恢复：{session_data.get('session_id', 'unknown')}")
-
     def list_sessions(self) -> List[Dict[str, Any]]:
-        """列出所有可用会话
-
-        Returns:
-            会话信息列表
-        """
-        if not self.session_store:
-            return []
-
-        return self.session_store.list_sessions()
+        """列出所有可用会话（代理到 SessionPlugin）"""
+        session_plugin = self._get_plugin("session")
+        if session_plugin:
+            return session_plugin.list_sessions()
+        return []
 
     def _get_agent_config(self) -> Dict[str, Any]:
-        """获取 Agent 配置信息
-
-        Returns:
-            配置字典
-        """
+        """获取 Agent 配置信息"""
         config = {
             "name": self.name,
             "agent_type": self.__class__.__name__,
@@ -831,27 +703,21 @@ class Agent(ABC):
             "llm_model": getattr(self.llm, 'model_id', getattr(self.llm, 'model', 'unknown'))
         }
 
-        # 添加 max_steps（如果存在）
         if hasattr(self, 'max_steps'):
             config["max_steps"] = self.max_steps
 
         return config
 
     def _compute_tool_schema_hash(self) -> str:
-        """计算工具 Schema 哈希
-
-        用于检测工具定义是否变化
-
-        Returns:
-            工具 Schema 哈希值（16位）
-        """
+        """计算工具 Schema 哈希（代理到 SessionPlugin）"""
+        session_plugin = self._get_plugin("session")
+        if session_plugin:
+            return session_plugin._compute_tool_schema_hash()
         if not self.tool_registry:
             return "no-tools"
-
+        
         import json
         from hashlib import sha256
-
-        # 收集所有工具的签名
         tools_signature = {}
         for tool_name in sorted(self.tool_registry.list_tools()):
             tool = self.tool_registry.get_tool(tool_name)
@@ -861,16 +727,11 @@ class Agent(ABC):
                     "description": tool.description[:100] if tool.description else "",
                     "parameters": list(tool.parameters.keys()) if hasattr(tool, 'parameters') and tool.parameters else []
                 }
-
         schema_str = json.dumps(tools_signature, sort_keys=True)
         return sha256(schema_str.encode()).hexdigest()[:16]
 
     def _get_read_cache(self) -> Dict[str, Dict]:
-        """获取 Read 工具的元数据缓存
-
-        Returns:
-            元数据缓存字典
-        """
+        """获取 Read 工具的元数据缓存"""
         if self.tool_registry and hasattr(self.tool_registry, 'read_metadata_cache'):
             return self.tool_registry.read_metadata_cache
         return {}
@@ -884,108 +745,83 @@ class Agent(ABC):
         return_summary: bool = True,
         max_steps_override: Optional[int] = None
     ) -> Dict[str, Any]:
-        """作为子代理运行（上下文隔离模式）
-
-        特性：
-        - 上下文隔离：创建独立的历史记录，不污染主 Agent 上下文
-        - 工具过滤：可选的工具访问控制
-        - 摘要返回：返回结构化摘要而非完整历史
-        - 状态恢复：执行后自动恢复原始状态
-
-        Args:
-            task: 子任务描述
-            tool_filter: 工具过滤器（可选），用于限制可用工具
-            return_summary: 是否返回摘要（True）或完整结果（False）
-            max_steps_override: 覆盖最大步数（可选）
-
-        Returns:
-            {
-                "success": bool,           # 是否成功完成
-                "summary": str,            # 任务摘要（如果 return_summary=True）
-                "result": str,             # 完整结果（如果 return_summary=False）
-                "metadata": {              # 执行元数据
-                    "steps": int,          # 执行步数
-                    "tokens": int,         # 消耗 Token 数（估算）
-                    "duration_seconds": float,  # 执行时长
-                    "tools_used": List[str],    # 使用的工具列表
-                    "error": Optional[str]      # 错误信息（如果失败）
-                }
-            }
-        """
-        from datetime import datetime
+        """作为子代理运行（代理到 SubAgentPlugin）"""
+        subagent_plugin = self._get_plugin("subagent")
+        if subagent_plugin:
+            return subagent_plugin.run_as_subagent(task, tool_filter, return_summary, max_steps_override)
+        
+        # 如果插件未启用，但用户显式调用，尝试临时创建并执行
+        # 这支持测试场景：config 禁用自动注册但手动调用
+        from ..tools.tool_filter import ToolFilter
+        from ..agents.factory import default_subagent_factory
+        from ..tools.builtin.task_tool import TaskTool
         import time
-
-        # 1. 保存当前状态
-        original_history = self.history_manager.get_history().copy()
+        
+        # 创建临时工厂
+        def agent_factory(agent_type: str):
+            if self.config.subagent_use_light_llm:
+                light_llm = self._create_light_llm()
+            else:
+                light_llm = self.llm
+            return default_subagent_factory(
+                agent_type=agent_type,
+                llm=light_llm,
+                tool_registry=self.tool_registry,
+                config=self.config
+            )
+        
+        # 保存状态
+        history_plugin = self._get_plugin("history")
+        original_history = history_plugin.get_history().copy() if history_plugin else []
         original_tools = None
         original_max_steps = None
-
-        # 2. 创建隔离的新历史
-        self.history_manager.clear()
-
-        # 3. 应用工具过滤（如果提供）
+        
+        if history_plugin:
+            history_plugin.clear_history()
+        
         if tool_filter and self.tool_registry:
             original_tools = self._apply_tool_filter(tool_filter)
-
-        # 4. 覆盖最大步数（如果提供）
+        
         if max_steps_override is not None and hasattr(self, 'max_steps'):
             original_max_steps = self.max_steps
             self.max_steps = max_steps_override
-
-        # 记录开始时间
+        
         start_time = time.time()
         success = False
         result = ""
         error_msg = None
-
+        
         try:
-            # 5. 执行任务
             result = self.run(task)
             success = True
-
         except KeyboardInterrupt:
             error_msg = "用户中断"
             raise
-
         except Exception as e:
             error_msg = str(e)
             result = f"执行失败: {error_msg}"
-
         finally:
-            # 记录执行时长
             duration = time.time() - start_time
-
-            # 6. 收集元数据
             metadata = self._get_subagent_metadata(duration, error_msg)
-
-            # 7. 生成摘要（如果需要）
+            
             if return_summary:
                 summary = self._generate_subagent_summary(task, result, metadata)
-
-            # 8. 恢复原始状态
-            self.history_manager.clear()
-            for msg in original_history:
-                self.history_manager.append(msg)
-
+            
+            if history_plugin:
+                history_plugin.clear_history()
+                for msg in original_history:
+                    history_plugin.add_message(msg)
+            
             if original_tools is not None:
                 self._restore_tools(original_tools)
-
+            
             if original_max_steps is not None:
                 self.max_steps = original_max_steps
-
-        # 9. 返回结果
+        
         if return_summary:
-            return {
-                "success": success,
-                "summary": summary,
-                "metadata": metadata
-            }
+            return {"success": success, "summary": summary, "metadata": metadata}
         else:
-            return {
-                "success": success,
-                "result": result,
-                "metadata": metadata
-            }
+            return {"success": success, "result": result, "metadata": metadata}
 
     def _apply_tool_filter(self, tool_filter: 'ToolFilter') -> List[str]:
         """应用工具过滤器
@@ -1162,71 +998,3 @@ class Agent(ABC):
                 tool_registry=self.tool_registry,
                 config=self.config
             )
-
-        # 创建并注册 TaskTool
-        task_tool = TaskTool(
-            agent_factory=agent_factory,
-            tool_registry=self.tool_registry,
-            config=self.config
-        )
-
-        self.tool_registry.register_tool(task_tool)
-
-    def _register_todowrite_tool(self):
-        """注册 TodoWriteTool（进度管理工具）
-
-        自动注册逻辑，在 __init__ 中调用（如果启用）
-        """
-        from ..tools.builtin.todowrite_tool import TodoWriteTool
-
-        # 创建并注册 TodoWriteTool
-        todo_tool = TodoWriteTool(
-            project_root=str(self.working_dir) if hasattr(self, 'working_dir') else ".",
-            persistence_dir=self.config.todowrite_persistence_dir
-        )
-
-        self.tool_registry.register_tool(todo_tool)
-
-    def _register_devlog_tool(self):
-        """注册 DevLogTool（开发日志工具）
-
-        自动注册逻辑，在 __init__ 中调用（如果启用）
-        """
-        from ..tools.builtin.devlog_tool import DevLogTool
-
-        # 获取 session_id（如果有 trace_logger 则使用其 session_id）
-        session_id = self.trace_logger.session_id if self.trace_logger else self._generate_session_id()
-
-        # 创建并注册 DevLogTool
-        devlog_tool = DevLogTool(
-            session_id=session_id,
-            agent_name=self.name,
-            project_root=str(self.working_dir) if hasattr(self, 'working_dir') else ".",
-            persistence_dir=self.config.devlog_persistence_dir
-        )
-
-        self.tool_registry.register_tool(devlog_tool)
-
-    def _generate_session_id(self) -> str:
-        """生成会话 ID（如果没有 trace_logger）"""
-        import uuid
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        random_suffix = uuid.uuid4().hex[:4]
-        return f"s-{timestamp}-{random_suffix}"
-
-    def _create_light_llm(self) -> HelloAgentsLLM:
-        """创建轻量模型 LLM 实例
-
-        Returns:
-            轻量模型 LLM 实例
-        """
-        # 复用主 LLM 的配置，但使用轻量模型
-        light_llm = HelloAgentsLLM(
-            provider=self.config.subagent_light_llm_provider,
-            model=self.config.subagent_light_llm_model,
-            temperature=self.llm.temperature if hasattr(self.llm, 'temperature') else 0.7,
-            max_tokens=self.llm.max_tokens if hasattr(self.llm, 'max_tokens') else None
-        )
-
-        return light_llm
