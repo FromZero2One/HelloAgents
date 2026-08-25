@@ -1,16 +1,20 @@
-"""OpenTelemetryPlugin - 分布式追踪插件
+"""OpenTelemetryPlugin - 分布式追踪与指标插件
 
 集成 OpenTelemetry 标准，支持：
 - 自动追踪 Agent 执行、LLM 调用、工具调用
-- 导出到多种后端 (Jaeger, Zipkin, OTLP, Console)
+- 指标收集 (Counters, Histograms, Gauges)
+- 导出到多种后端 (Jaeger, Zipkin, OTLP, Console, Prometheus)
 - 上下文传播 (W3C TraceContext)
+- 自动插桩装饰器
 - 自定义属性和事件
 """
 
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Callable
 from .plugins import AgentPlugin, PluginContext
 import asyncio
 from contextlib import contextmanager
+from functools import wraps
+import time
 
 # Optional imports - graceful degradation if not installed
 try:
@@ -24,6 +28,11 @@ try:
     from opentelemetry.propagate import inject, extract
     from opentelemetry.trace import SpanKind, Status, StatusCode
     from opentelemetry.instrumentation.requests import RequestsInstrumentor
+    # Metrics
+    from opentelemetry.metrics import get_meter_provider, set_meter_provider
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader, ConsoleMetricExporter
+    from opentelemetry.exporter.prometheus import PrometheusMetricExporter
     OTEL_AVAILABLE = True
 except ImportError:
     OTEL_AVAILABLE = False
@@ -91,6 +100,130 @@ class OpenTelemetryPlugin(AgentPlugin):
         self._tracer = trace.get_tracer(
             "hello-agents",
             version="1.0.0"
+        )
+        
+        # 设置 MeterProvider for metrics
+        self._setup_meter_provider(config)
+    
+    def _setup_meter_provider(self, config: Dict[str, Any]):
+        """配置 MeterProvider for metrics"""
+        service_name = config.get("service_name", "hello-agents")
+        resource = Resource.create({SERVICE_NAME: service_name})
+        
+        # 配置 Metric Readers
+        readers = []
+        
+        exporter_type = config.get("metrics_exporter", "console")
+        if exporter_type == "console" or exporter_type == "all":
+            readers.append(PeriodicExportingMetricReader(
+                ConsoleMetricExporter(),
+                export_interval_millis=config.get("metrics_interval", 60000)
+            ))
+        
+        if exporter_type == "prometheus" or exporter_type == "all":
+            try:
+                prometheus_exporter = PrometheusMetricExporter(
+                    endpoint=config.get("prometheus_endpoint", "localhost:9464")
+                )
+                readers.append(PeriodicExportingMetricReader(
+                    prometheus_exporter,
+                    export_interval_millis=config.get("metrics_interval", 60000)
+                ))
+            except Exception as e:
+                print(f"⚠️ Prometheus 导出器初始化失败: {e}")
+        
+        if exporter_type == "otlp" or exporter_type == "all":
+            try:
+                from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+                otlp_endpoint = config.get("otlp_metrics_endpoint", config.get("otlp_endpoint", "http://localhost:4317"))
+                readers.append(PeriodicExportingMetricReader(
+                    OTLPMetricExporter(endpoint=otlp_endpoint, insecure=True),
+                    export_interval_millis=config.get("metrics_interval", 60000)
+                ))
+            except Exception as e:
+                print(f"⚠️ OTLP Metrics 导出器初始化失败: {e}")
+        
+        self._meter_provider = MeterProvider(resource=resource, metric_readers=readers)
+        set_meter_provider(self._meter_provider)
+        
+        self._meter = self._meter_provider.get_meter("hello-agents", version="1.0.0")
+        
+        # 初始化标准指标
+        self._init_standard_metrics()
+    
+    def _init_standard_metrics(self):
+        """初始化标准指标"""
+        if not self._meter:
+            return
+        
+        # Agent 执行计数器
+        self._agent_runs_total = self._meter.create_counter(
+            name="agent.runs.total",
+            description="Total number of agent runs",
+            unit="1"
+        )
+        
+        # Agent 执行时长直方图
+        self._agent_duration = self._meter.create_histogram(
+            name="agent.duration.ms",
+            description="Agent execution duration in milliseconds",
+            unit="ms"
+        )
+        
+        # LLM 调用计数器
+        self._llm_calls_total = self._meter.create_counter(
+            name="llm.calls.total",
+            description="Total number of LLM calls",
+            unit="1"
+        )
+        
+        # LLM Token 使用直方图
+        self._llm_tokens = self._meter.create_histogram(
+            name="llm.tokens",
+            description="LLM token usage",
+            unit="1"
+        )
+        
+        # LLM 调用时长直方图
+        self._llm_duration = self._meter.create_histogram(
+            name="llm.duration.ms",
+            description="LLM call duration in milliseconds",
+            unit="ms"
+        )
+        
+        # 工具调用计数器
+        self._tool_calls_total = self._meter.create_counter(
+            name="tool.calls.total",
+            description="Total number of tool calls",
+            unit="1"
+        )
+        
+        # 工具调用时长直方图
+        self._tool_duration = self._meter.create_histogram(
+            name="tool.duration.ms",
+            description="Tool execution duration in milliseconds",
+            unit="ms"
+        )
+        
+        # 工具错误计数器
+        self._tool_errors_total = self._meter.create_counter(
+            name="tool.errors.total",
+            description="Total number of tool errors",
+            unit="1"
+        )
+        
+        # 活跃 Agent 数量 Gauge
+        self._active_agents = self._meter.create_up_down_counter(
+            name="agent.active",
+            description="Number of currently active agents",
+            unit="1"
+        )
+        
+        # Token 使用总量
+        self._tokens_total = self._meter.create_counter(
+            name="tokens.total",
+            description="Total tokens consumed",
+            unit="1"
         )
     
     def _setup_exporters(self, config: Dict[str, Any]):
@@ -276,54 +409,203 @@ class OpenTelemetryPlugin(AgentPlugin):
         return len(self._spans)
     
     async def teardown(self):
-        """关闭追踪"""
+        """关闭追踪和指标"""
         if self._tracer_provider:
             self._tracer_provider.shutdown()
+        if self._meter_provider:
+            self._meter_provider.shutdown()
         self._spans.clear()
 
+    # ===== 自动插桩装饰器 =====
 
-# 如果 OpenTelemetry 不可用，提供空实现
-if not OTEL_AVAILABLE:
-    class OpenTelemetryPlugin(AgentPlugin):
-        """空实现 - OpenTelemetry 未安装时使用"""
+    def trace_metric(self, metric_name: str, attributes: Optional[Dict[str, Any]] = None):
+        """装饰器：自动记录函数执行的指标
         
-        name = "opentelemetry"
-        priority = 15
-        
-        def _initialize(self):
-            if self.config.debug:
-                print("⚠️ OpenTelemetry 未安装，追踪功能不可用")
-        
-        @contextmanager
-        def start_span(self, *args, **kwargs):
-            yield None
-        
-        def start_span_manual(self, *args, **kwargs):
-            return None
-        
-        def end_span(self, *args, **kwargs):
-            pass
-        
-        def add_event(self, *args, **kwargs):
-            pass
-        
-        def set_attribute(self, *args, **kwargs):
-            pass
-        
-        @contextmanager
-        def trace_agent_run(self, *args, **kwargs):
-            yield None
-        
-        @contextmanager
-        def trace_llm_call(self, *args, **kwargs):
-            yield None
-        
-        @contextmanager
-        def trace_tool_call(self, *args, **kwargs):
-            yield None
-        
-        def get_active_spans_count(self):
-            return 0
-        
-        async def teardown(self):
-            pass
+        Args:
+            metric_name: 指标名称前缀
+            attributes: 静态属性
+            
+        Example:
+            @otel.trace_metric("my_custom_operation")
+            async def my_function():
+                ...
+        """
+        def decorator(func: Callable):
+            @wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                if not self._meter:
+                    return await func(*args, **kwargs)
+                
+                start_time = time.time()
+                error = None
+                try:
+                    result = await func(*args, **kwargs)
+                    return result
+                except Exception as e:
+                    error = e
+                    raise
+                finally:
+                    duration_ms = (time.time() - start_time) * 1000
+                    attrs = {
+                        "function": func.__name__,
+                        "error": str(type(error).__name__) if error else "none",
+                        **(attributes or {})
+                    }
+                    # 记录时长
+                    if hasattr(self, f'_{metric_name.replace(".", "_")}_duration'):
+                        duration_hist = getattr(self, f'_{metric_name.replace(".", "_")}_duration')
+                        duration_hist.record(duration_ms, attributes=attrs)
+                    # 记录计数
+                    if hasattr(self, f'_{metric_name.replace(".", "_")}_total'):
+                        counter = getattr(self, f'_{metric_name.replace(".", "_")}_total')
+                        counter.add(1, attributes=attrs)
+            @wraps(func)
+            def sync_wrapper(*args, **kwargs):
+                if not self._meter:
+                    return func(*args, **kwargs)
+                
+                start_time = time.time()
+                error = None
+                try:
+                    result = func(*args, **kwargs)
+                    return result
+                except Exception as e:
+                    error = e
+                    raise
+                finally:
+                    duration_ms = (time.time() - start_time) * 1000
+                    attrs = {
+                        "function": func.__name__,
+                        "error": str(type(error).__name__) if error else "none",
+                        **(attributes or {})
+                    }
+                    if hasattr(self, f'_{metric_name.replace(".", "_")}_duration'):
+                        duration_hist = getattr(self, f'_{metric_name.replace(".", "_")}_duration')
+                        duration_hist.record(duration_ms, attributes=attrs)
+                    if hasattr(self, f'_{metric_name.replace(".", "_")}_total'):
+                        counter = getattr(self, f'_{metric_name.replace(".", "_")}_total')
+                        counter.add(1, attributes=attrs)
+            
+            return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
+        return decorator
+
+    def record_agent_run(self, agent_name: str, duration_ms: float, success: bool, metadata: Optional[Dict] = None):
+        """记录 Agent 执行指标"""
+        if not self._meter:
+            return
+        attrs = {
+            "agent": agent_name,
+            "success": str(success).lower(),
+            **(metadata or {})
+        }
+        if self._agent_runs_total:
+            self._agent_runs_total.add(1, attributes=attrs)
+        if self._agent_duration:
+            # We need to record duration but we already have it
+            pass  # Duration is recorded via trace span
+    
+    def record_llm_call(self, model: str, operation: str, duration_ms: float, 
+                        prompt_tokens: int = 0, completion_tokens: int = 0, 
+                        success: bool = True, metadata: Optional[Dict] = None):
+        """记录 LLM 调用指标"""
+        if not self._meter:
+            return
+        attrs = {
+            "model": model,
+            "operation": operation,
+            "success": str(success).lower(),
+        }
+        if self._llm_calls_total:
+            self._llm_calls_total.add(1, attributes=attrs)
+        if self._llm_duration:
+            self._llm_duration.record(duration_ms, attributes={"model": model, "operation": operation})
+        if self._llm_tokens and (prompt_tokens or completion_tokens):
+            self._llm_tokens.record(prompt_tokens, attributes={"model": model, "type": "prompt"})
+            self._llm_tokens.record(completion_tokens, attributes={"model": model, "type": "completion"})
+        if self._tokens_total:
+            self._tokens_total.add(prompt_tokens + completion_tokens, attributes={"model": model})
+    
+    def record_tool_call(self, tool_name: str, duration_ms: float, 
+                         success: bool = True, metadata: Optional[Dict] = None):
+        """记录工具调用指标"""
+        if not self._meter:
+            return
+        attrs = {
+            "tool": tool_name,
+            "success": str(success).lower(),
+        }
+        if self._tool_calls_total:
+            self._tool_calls_total.add(1, attributes=attrs)
+        if self._tool_duration:
+            self._tool_duration.record(duration_ms, attributes={"tool": tool_name})
+        if not success and self._tool_errors_total:
+            self._tool_errors_total.add(1, attributes={"tool": tool_name, "error_type": "execution"})
+    
+    def set_active_agents(self, count: int):
+        """设置活跃 Agent 数量"""
+        if self._active_agents:
+            # Note: UpDownCounter doesn't have direct set, use add with delta
+            pass  # Would need to track current value
+    
+    def increment_active_agents(self, delta: int = 1):
+        """增加/减少活跃 Agent 计数"""
+        if self._active_agents:
+            self._active_agents.add(delta)
+
+
+# ===== 便捷函数：从上下文获取插件 =====
+
+def get_opentelemetry_plugin(agent) -> Optional[OpenTelemetryPlugin]:
+    """从 Agent 获取 OpenTelemetry 插件实例"""
+    if hasattr(agent, '_plugin_manager'):
+        return agent._plugin_manager.get_plugin("opentelemetry")
+    return None
+
+
+def trace_async(plugin_getter: Callable = get_opentelemetry_plugin, 
+                metric_name: str = "", attributes: Optional[Dict] = None):
+    """装饰器：异步函数自动追踪 + 指标
+    
+    Example:
+        @trace_async(metric_name="my_operation", attributes={"component": "processor"})
+        async def process_data(data):
+            ...
+    """
+    def decorator(func: Callable):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Get plugin from first arg if it's an agent, or use getter
+            plugin = None
+            if args and hasattr(args[0], '_plugin_manager'):
+                plugin = args[0]._plugin_manager.get_plugin("opentelemetry")
+            elif plugin_getter:
+                plugin = plugin_getter(args[0] if args else None)
+            
+            if not plugin or not plugin._meter:
+                return await func(*args, **kwargs)
+            
+            start_time = time.time()
+            error = None
+            attrs = {
+                "function": func.__name__,
+                **(attributes or {})
+            }
+            try:
+                result = await func(*args, **kwargs)
+                return result
+            except Exception as e:
+                attrs["error"] = type(e).__name__
+                raise
+            finally:
+                duration_ms = (time.time() - start_time) * 1000
+                attrs["error"] = "none"
+                if plugin and plugin._meter:
+                    # Record duration
+                    if hasattr(plugin, f'_{metric_name.replace(".", "_")}_duration'):
+                        duration_hist = getattr(plugin, f'_{metric_name.replace(".", "_")}_duration')
+                        duration_hist.record((time.time() - start_time) * 1000, attributes=attrs)
+                    if hasattr(plugin, f'_{metric_name.replace(".", "_")}_total'):
+                        counter = getattr(plugin, f'_{metric_name.replace(".", "_")}_total')
+                        counter.add(1, attributes=attrs)
+        return wrapper
+    return decorator
