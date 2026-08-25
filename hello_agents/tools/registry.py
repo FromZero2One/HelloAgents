@@ -42,17 +42,17 @@ class ToolRegistry:
                 # 注册所有展开的子工具
                 for sub_tool in expanded_tools:
                     if sub_tool.name in self._tools:
-                        print(f"⚠️ 警告：工具 '{sub_tool.name}' 已存在，将被覆盖。")
+                        print(f"[WARN] Tool '{sub_tool.name}' already exists, will be overwritten.")
                     self._tools[sub_tool.name] = sub_tool
-                print(f"✅ 工具 '{tool.name}' 已展开为 {len(expanded_tools)} 个独立工具")
+                print(f"[OK] Tool '{tool.name}' expanded into {len(expanded_tools)} independent tools")
                 return
 
         # 普通工具或不展开的工具
         if tool.name in self._tools:
-            print(f"⚠️ 警告：工具 '{tool.name}' 已存在，将被覆盖。")
+            print(f"[WARN] Tool '{tool.name}' already exists, will be overwritten.")
 
         self._tools[tool.name] = tool
-        print(f"✅ 工具 '{tool.name}' 已注册。")
+        print(f"[OK] Tool '{tool.name}' registered.")
 
     def register_function(
         self,
@@ -101,24 +101,24 @@ class ToolRegistry:
                 description = f"执行 {name}"
 
         if name in self._functions:
-            print(f"⚠️ 警告：工具 '{name}' 已存在，将被覆盖。")
+            print(f"[WARN] Function tool '{name}' already exists, will be overwritten.")
 
         self._functions[name] = {
             "description": description,
             "func": func
         }
-        print(f"✅ 函数工具 '{name}' 已注册。")
+        print(f"[OK] Function tool '{name}' registered.")
 
     def unregister(self, name: str):
         """注销工具"""
         if name in self._tools:
             del self._tools[name]
-            print(f"🗑️ 工具 '{name}' 已注销。")
+            print(f"[OK] Tool '{name}' unregistered.")
         elif name in self._functions:
             del self._functions[name]
-            print(f"🗑️ 工具 '{name}' 已注销。")
+            print(f"[OK] Function tool '{name}' unregistered.")
         else:
-            print(f"⚠️ 工具 '{name}' 不存在。")
+            print(f"[WARN] Tool '{name}' not found.")
 
     def get_tool(self, name: str) -> Optional[Tool]:
         """获取Tool对象"""
@@ -250,7 +250,7 @@ class ToolRegistry:
         """清空所有工具"""
         self._tools.clear()
         self._functions.clear()
-        print("🧹 所有工具已清空。")
+        print("[OK] All tools cleared.")
 
     # ==================== 乐观锁机制支持 ====================
 

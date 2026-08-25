@@ -6,6 +6,7 @@ from .message import Message
 from .config import Config
 from .exceptions import HelloAgentsException
 from .llm_response import LLMResponse, StreamStats
+from .graph import AgentGraph, GraphNode, GraphState, NodeStatus
 
 __all__ = [
     "Agent",
@@ -14,5 +15,9 @@ __all__ = [
     "Config",
     "HelloAgentsException",
     "LLMResponse",
-    "StreamStats"
+    "StreamStats",
+    "AgentGraph",
+    "GraphNode",
+    "GraphState",
+    "NodeStatus"
 ]

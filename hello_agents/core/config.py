@@ -99,6 +99,19 @@ class Config(BaseModel):
     #     }
     # ]
 
+    # OpenTelemetry 分布式追踪配置
+    opentelemetry: Optional[Dict[str, Any]] = None  # 追踪配置字典
+    # 示例：
+    # opentelemetry = {
+    #     "enabled": True,
+    #     "exporter": "otlp",  # console, otlp, jaeger, zipkin, all
+    #     "service_name": "hello-agents",
+    #     "otlp_endpoint": "http://localhost:4317",
+    #     "jaeger_endpoint": "http://localhost:14250",
+    #     "zipkin_endpoint": "http://localhost:9411/api/v2/spans",
+    #     "instrument_requests": True,
+    # }
+
     @classmethod
     def from_env(cls) -> "Config":
         """从环境变量创建配置"""
