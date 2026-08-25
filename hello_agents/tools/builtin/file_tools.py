@@ -534,7 +534,7 @@ class EditTool(Tool):
                 return ToolResponse.error(
                     code=ToolErrorCode.INVALID_PARAM,
                     message=f"old_string 必须唯一匹配文件内容。找到 {matches} 处匹配。",
-                    data={"matches": matches}
+                    context={"matches": matches}
                 )
 
             # 执行替换

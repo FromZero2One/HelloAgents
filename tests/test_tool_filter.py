@@ -18,7 +18,7 @@ class TestReadOnlyFilter:
         
         all_tools = [
             "Read", "Write", "Edit", "LS", "Grep",
-            "Bash", "MemoryTool", "SearchTool"
+            "Bash", "Glob", "Skill"
         ]
         
         filtered = filter_obj.filter(all_tools)
@@ -27,8 +27,8 @@ class TestReadOnlyFilter:
         assert "Read" in filtered
         assert "LS" in filtered
         assert "Grep" in filtered
-        assert "MemoryTool" in filtered
-        assert "SearchTool" in filtered
+        assert "Glob" in filtered
+        assert "Skill" in filtered
         
         # 不应该包含写入工具
         assert "Write" not in filtered

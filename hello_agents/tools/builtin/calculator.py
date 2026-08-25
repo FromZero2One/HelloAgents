@@ -103,10 +103,8 @@ class CalculatorTool(Tool):
     
     def _eval_node(self, node):
         """递归计算AST节点"""
-        if isinstance(node, ast.Constant):  # Python 3.8+
+        if isinstance(node, ast.Constant):  # Python 3.8+ (includes 3.14+)
             return node.value
-        elif isinstance(node, ast.Num):  # Python < 3.8
-            return node.n
         elif isinstance(node, ast.BinOp):
             return self.OPERATORS[type(node.op)](
                 self._eval_node(node.left), 
