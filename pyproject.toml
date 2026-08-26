@@ -42,6 +42,9 @@ exclude = ["tests*", "examples*", "docs*"]
 [tool.setuptools.package-data]
 hello_agents = ["py.typed"]
 
+[project.scripts]
+hello-agents = "hello_agents.cli:main"
+
 [tool.black]
 line-length = 88
 target-version = ['py310']

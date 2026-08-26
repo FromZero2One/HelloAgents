@@ -14,6 +14,8 @@ import json
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from ..tools.circuit_breaker import CircuitBreaker
+from ..tools.errors import ToolErrorCode
 
 
 class ConnectionState(Enum):
@@ -46,7 +48,7 @@ class MCPServerConfig:
 
 
 class MCPConnectionPool:
-    """MCP 连接池 - 管理单个服务器的多个连接"""
+    """MCP 连接池 - 管理单个服务器的多个连接（含熔断器保护）"""
     
     def __init__(self, config: MCPServerConfig):
         self.config = config
@@ -58,6 +60,12 @@ class MCPConnectionPool:
         self._state = ConnectionState.DISCONNECTED
         self._last_health_check: float = 0
         self._consecutive_failures = 0
+        # 熔断器 - 保护整个连接池
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=config.max_retries,
+            recovery_timeout=int(config.retry_delay * config.retry_backoff ** (config.max_retries - 1)),
+            name=f"mcp_pool_{config.name}"
+        )
     
     @property
     def state(self) -> ConnectionState:
@@ -94,7 +102,13 @@ class MCPConnectionPool:
             return False
     
     async def acquire(self) -> Optional[MCPClient]:
-        """获取可用连接"""
+        """获取可用连接（带熔断器保护）"""
+        # 检查熔断器
+        if self._circuit_breaker.is_open():
+            status = self._circuit_breaker.get_status()
+            print(f"⚠️ MCP 连接池熔断开启 ({self.config.name}), {status['recover_in_seconds']:.0f}秒后恢复")
+            return None
+        
         if self._state != ConnectionState.CONNECTED:
             # 尝试重新初始化
             await self.initialize()
@@ -256,7 +270,7 @@ def import_os_environ():
 
 
 class MCPPlugin(AgentPlugin):
-    """MCP 支持插件 - 管理多个 MCP 服务器连接池（健康检查、自动重连）"""
+    """MCP 支持插件 - 管理多个 MCP 服务器连接池（健康检查、自动重连、工具发现缓存、熔断器）"""
     
     name = "mcp"
     priority = 25  # 在 ToolPlugin 之前加载，以便注册工具
@@ -265,6 +279,10 @@ class MCPPlugin(AgentPlugin):
         super().__init__(config)
         self._pools: Dict[str, MCPConnectionPool] = {}
         self._mcp_config: List[Dict[str, Any]] = []
+        # 工具发现缓存
+        self._tool_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._cache_timestamps: Dict[str, float] = {}
+        self._cache_ttl: int = 300  # 5分钟缓存TTL
     
     def _initialize(self) -> None:
         # 从配置读取 MCP 服务器列表
@@ -417,8 +435,62 @@ class MCPPlugin(AgentPlugin):
             for name, pool in self._pools.items()
         }
     
+    # ==================== 工具发现缓存 ====================
+    
+    def _is_cache_valid(self, server_name: str) -> bool:
+        """检查缓存是否有效"""
+        if server_name not in self._tool_cache:
+            return False
+        age = time.time() - self._cache_timestamps.get(server_name, 0)
+        return age < self._cache_ttl
+    
+    def get_tools_cached(self, server_name: str) -> List[Dict[str, Any]]:
+        """获取工具列表（优先使用缓存）"""
+        if self._is_cache_valid(server_name):
+            return self._tool_cache[server_name]
+        return []
+    
+    async def refresh_tool_cache(self, server_name: str) -> List[Dict[str, Any]]:
+        """刷新工具缓存（从服务器获取最新工具列表）"""
+        if server_name not in self._pools:
+            return []
+        
+        pool = self._pools[server_name]
+        client = await pool.acquire()
+        if not client:
+            return self.get_tools_cached(server_name)
+        
+        try:
+            tools = await client.list_tools()
+            self._tool_cache[server_name] = tools
+            self._cache_timestamps[server_name] = time.time()
+            return tools
+        except Exception as e:
+            print(f"⚠️ 刷新工具缓存失败 ({server_name}): {e}")
+            return self.get_tools_cached(server_name)
+        finally:
+            await pool.release(client)
+    
+    async def refresh_all_caches(self):
+        """刷新所有服务器的工具缓存"""
+        for server_name in self._pools:
+            await self.refresh_tool_cache(server_name)
+    
+    def set_cache_ttl(self, ttl: int):
+        """设置缓存TTL（秒）"""
+        self._cache_ttl = max(60, ttl)  # 最小60秒
+    
+    def clear_cache(self, server_name: Optional[str] = None):
+        """清除缓存"""
+        if server_name:
+            self._tool_cache.pop(server_name, None)
+            self._cache_timestamps.pop(server_name, None)
+        else:
+            self._tool_cache.clear()
+            self._cache_timestamps.clear()
+    
     async def call_mcp_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
-        """调用 MCP 工具（带服务器前缀）"""
+        """调用 MCP 工具（带服务器前缀，熔断器保护）"""
         # 解析服务器名称
         if "__" not in tool_name:
             return f"❌ 无效的 MCP 工具名格式: {tool_name} (应为 server__tool)"
@@ -426,10 +498,22 @@ class MCPPlugin(AgentPlugin):
         server_name, original_name = tool_name.split("__", 1)
         if server_name in self._pools:
             pool = self._pools[server_name]
+            # 检查熔断器
+            if pool._circuit_breaker.is_open():
+                status = pool._circuit_breaker.get_status()
+                return f"❌ MCP 服务器熔断开启 ({server_name}), {status['recover_in_seconds']:.0f}秒后恢复"
+            
             client = await pool.acquire()
             if client:
                 try:
-                    return await client.call_tool(original_name, arguments)
+                    result = await client.call_tool(original_name, arguments)
+                    # 记录成功
+                    pool._circuit_breaker.record_result(True)
+                    return result
+                except Exception as e:
+                    # 记录失败
+                    pool._circuit_breaker.record_result(False)
+                    return f"❌ MCP 工具调用失败: {e}"
                 finally:
                     await pool.release(client)
         return f"❌ MCP 服务器未找到: {server_name}"

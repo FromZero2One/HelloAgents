@@ -97,7 +97,7 @@ class CircuitBreaker:
         # 检查是否达到阈值
         if self.failure_counts[tool_name] >= self.failure_threshold:
             self.open_timestamps[tool_name] = time.time()
-            print(f"🔴 Circuit Breaker: 工具 '{tool_name}' 已熔断（连续 {self.failure_counts[tool_name]} 次失败）")
+            print(f"[Circuit Breaker] 工具 '{tool_name}' 已熔断（连续 {self.failure_counts[tool_name]} 次失败）")
 
     def _on_success(self, tool_name: str):
         """处理成功"""
@@ -110,13 +110,13 @@ class CircuitBreaker:
             return
 
         self.open_timestamps[tool_name] = time.time()
-        print(f"🔴 Circuit Breaker: 工具 '{tool_name}' 已手动熔断")
+        print(f"[Circuit Breaker] 工具 '{tool_name}' 已手动熔断")
 
     def close(self, tool_name: str):
         """关闭熔断，恢复工具"""
         self.failure_counts[tool_name] = 0
         self.open_timestamps.pop(tool_name, None)
-        print(f"🟢 Circuit Breaker: 工具 '{tool_name}' 已恢复")
+        print(f"[Circuit Breaker] 工具 '{tool_name}' 已恢复")
 
     def get_status(self, tool_name: str) -> Dict[str, any]:
         """

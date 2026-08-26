@@ -105,35 +105,46 @@ hello-agents/
 │   │   ├── agent.py           # Agent 基类（Function Calling 架构）
 │   │   ├── session_store.py   # 会话持久化
 │   │   ├── lifecycle.py       # 异步生命周期
-│   │   └── streaming.py       # SSE 流式输出
+│   │   ├── streaming.py       # SSE 流式输出
+│   │   ├── graph.py           # AgentGraph 编排图（循环检测/可视化导出）
+│   │   ├── plugins.py         # 插件系统基类
+│   │   ├── plugins_*.py       # 15+ 个功能插件（History/Token/Truncator/Todo/DevLog/Skill/MCP/OTel等）
 │   ├── agents/                # Agent 实现
 │   │   ├── simple_agent.py    # SimpleAgent
 │   │   ├── react_agent.py     # ReActAgent
 │   │   ├── reflection_agent.py # ReflectionAgent
-│   │   └── plan_solve_agent.py # PlanAndSolveAgent
+│   │   ├── plan_solve_agent.py # PlanAndSolveAgent
+│   │   ├── agent_mvp.py       # Agent MVP 基类
+│   │   └── factory.py         # AgentFactory 创建工厂
 │   ├── tools/                 # 工具系统
 │   │   ├── registry.py        # 工具注册表
 │   │   ├── response.py        # ToolResponse 协议
 │   │   ├── circuit_breaker.py # 熔断器
 │   │   ├── tool_filter.py     # 工具过滤（子代理机制）
-│   │   └── builtin/           # 内置工具
-│   │       ├── file_tools.py  # 文件工具（乐观锁）
-│   │       ├── task_tool.py   # 子代理工具
-│   │       ├── todowrite_tool.py # 进度管理
-│   │       ├── devlog_tool.py # 决策日志
-│   │       └── skill_tool.py  # Skills 知识外化
+│   │   ├── base.py            # Tool 基类
+│   │   ├── errors.py          # 错误码定义
+│   │   ├── builtin/           # 内置工具
+│   │   │   ├── file_tools.py  # 文件工具（乐观锁）
+│   │   │   ├── task_tool.py   # 子代理工具
+│   │   │   ├── todowrite_tool.py # 进度管理
+│   │   │   ├── devlog_tool.py # 决策日志
+│   │   │   ├── skill_tool.py  # Skills 知识外化
+│   │   │   └── calculator.py  # 计算器工具
+│   │   └── mcp/               # MCP 连接池（熔断/缓存/健康检查）
 │   ├── context/               # 上下文工程
 │   │   ├── history.py         # HistoryManager
 │   │   ├── token_counter.py   # TokenCounter
 │   │   ├── truncator.py       # ObservationTruncator
 │   │   └── builder.py         # ContextBuilder
 │   ├── observability/         # 可观测性
-│   │   └── trace_logger.py    # TraceLogger
-│   └── skills/                # Skills 系统
-│       └── loader.py          # SkillLoader
+│   │   ├── trace_logger.py    # TraceLogger (JSONL/HTML)
+│   │   └── plugins_otel.py    # OpenTelemetry 指标/插桩
+│   ├── skills/                # Skills 系统
+│   │   └── loader.py          # SkillLoader
+│   └── cli.py                 # CLI 脚手架 (init/run/benchmark/version)
 ├── docs/                      # 文档
 ├── examples/                  # 示例代码
-└── tests/                     # 测试用例
+└── tests/                     # 测试用例 (217 tests)
 ```
 
 ## 🤝 贡献
@@ -175,12 +186,15 @@ hello-agents/
 - **[可观测性](./docs/observability-guide.md)** - TraceLogger 追踪系统
 - **[熔断器](./docs/circuit-breaker-guide.md)** - CircuitBreaker 容错机制
 - **[会话持久化](./docs/session-persistence-guide.md)** - SessionStore 会话管理
+- **[OpenTelemetry 指标](./docs/otel-guide.md)** - 指标收集/自动插桩/多导出器
+- **[AgentGraph 编排](./docs/agent-graph-guide.md)** - 循环检测/Mermaid/GraphViz 导出
 
 ### 增强能力
 - **[子代理机制](./docs/subagent-guide.md)** - TaskTool 与 ToolFilter
 - **[Skills 知识外化](./docs/skills-usage-guide.md)** - 技能系统使用指南
 - **[乐观锁](./docs/file_tools.md)** - 文件编辑工具的并发控制
 - **[TodoWrite 进度管理](./docs/todowrite-usage-guide.md)** - 任务进度追踪
+- **[MCP 连接池](./docs/mcp-guide.md)** - 连接复用/熔断/工具发现缓存
 
 ### 辅助功能
 - **[DevLog 决策日志](./docs/devlog-guide.md)** - 开发决策记录
@@ -193,6 +207,9 @@ hello-agents/
 
 ### 扩展能力
 - **[自定义工具扩展](./docs/custom_tools_guide.md)** - 三种工具实现方式（函数式/标准类/可展开）
+
+### CLI 脚手架
+- **[CLI 使用指南](./docs/cli-guide.md)** - init/run/benchmark/version 命令
 
 ---
 

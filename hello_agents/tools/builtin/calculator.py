@@ -65,7 +65,7 @@ class CalculatorTool(Tool):
                 message="计算表达式不能为空"
             )
 
-        print(f"🧮 正在计算: {expression}")
+        print(f"正在计算: {expression}")
 
         try:
             # 解析表达式
@@ -73,11 +73,11 @@ class CalculatorTool(Tool):
             result = self._eval_node(node.body)
             result_str = str(result)
 
-            print(f"✅ 计算结果: {result_str}")
+            print(f"计算结果: {result_str}")
 
             return ToolResponse.success(
                 text=f"计算结果: {result_str}",
-         data={
+                data={
                     "expression": expression,
                     "result": result,
                     "result_str": result_str,
@@ -86,7 +86,7 @@ class CalculatorTool(Tool):
             )
         except SyntaxError as e:
             error_msg = f"表达式语法错误: {str(e)}"
-            print(f"❌ {error_msg}")
+            print(f"[ERROR] {error_msg}")
             return ToolResponse.error(
                 code=ToolErrorCode.INVALID_FORMAT,
                 message=error_msg,
@@ -94,7 +94,7 @@ class CalculatorTool(Tool):
             )
         except Exception as e:
             error_msg = f"计算失败: {str(e)}"
-            print(f"❌ {error_msg}")
+            print(f"[ERROR] {error_msg}")
             return ToolResponse.error(
                 code=ToolErrorCode.EXECUTION_ERROR,
                 message=error_msg,

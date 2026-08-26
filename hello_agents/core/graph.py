@@ -14,6 +14,8 @@ from abc import ABC, abstractmethod
 import asyncio
 import uuid
 from datetime import datetime
+import json
+from collections import deque
 
 
 class NodeStatus(Enum):
@@ -538,6 +540,246 @@ class AgentGraph:
             path = os.path.join(self.checkpoint_dir, f"{self.name}_{self._execution_id}_checkpoint.json")
             with open(path, 'w') as f:
                 json.dump(checkpoint, f, indent=2)
+
+    # ==================== 循环检测 ====================
+
+    def detect_cycles(self) -> List[List[str]]:
+        """检测图中的所有环路
+        
+        使用 Tarjan 算法 (DFS + 栈) 查找强连通分量
+        
+        Returns:
+            环路列表，每个环路是节点名称列表
+        """
+        index = 0
+        stack = []
+        on_stack = set()
+        indices = {}
+        lowlinks = {}
+        cycles = []
+        
+        def strongconnect(node_name: str):
+            nonlocal index
+            indices[node_name] = index
+            lowlinks[node_name] = index
+            index += 1
+            stack.append(node_name)
+            on_stack.add(node_name)
+            
+            # 遍历所有出边
+            for edge in self._adjacency.get(node_name, []):
+                target = edge.target
+                if target not in indices:
+                    strongconnect(target)
+                    lowlinks[node_name] = min(lowlinks[node_name], lowlinks[target])
+                elif target in on_stack:
+                    lowlinks[node_name] = min(lowlinks[node_name], indices[target])
+            
+            # 如果是强连通分量的根节点
+            if lowlinks[node_name] == indices[node_name]:
+                # 弹出栈直到找到当前节点
+                scc = []
+                while True:
+                    w = stack.pop()
+                    on_stack.remove(w)
+                    scc.append(w)
+                    if w == node_name:
+                        break
+                # 如果 SCC 大小 > 1，或者有自环，则是环路
+                if len(scc) > 1:
+                    cycles.append(scc)
+                elif len(scc) == 1:
+                    # 检查自环
+                    node_name = scc[0]
+                    for edge in self._adjacency.get(node_name, []):
+                        if edge.target == node_name:
+                            cycles.append([node_name])
+                            break
+        
+        for node_name in self._nodes:
+            if node_name not in indices:
+                strongconnect(node_name)
+        
+        return cycles
+
+    def has_cycles(self) -> bool:
+        """快速检查是否有环路"""
+        return len(self.detect_cycles()) > 0
+
+    def validate_dag(self) -> tuple[bool, List[List[str]]]:
+        """验证是否为有向无环图 (DAG)
+        
+        Returns:
+            (是否为DAG, 环路列表)
+        """
+        cycles = self.detect_cycles()
+        return len(cycles) == 0, cycles
+
+    # ==================== 可视化导出 ====================
+
+    def to_mermaid(self, direction: str = "TD", show_status: bool = False) -> str:
+        """导出为 Mermaid 流程图格式
+        
+        Args:
+            direction: 流向 (TD=上下, LR=左右, RL=右左, BT=下上)
+            show_status: 是否显示节点状态 (需先执行 run())
+            
+        Returns:
+            Mermaid 格式字符串
+        """
+        lines = [f"graph {direction}", "    %% Nodes"]
+        
+        # 定义节点样式
+        node_styles = {}
+        for name, node in self._nodes.items():
+            node_type = type(node).__name__
+            label = f"{name}\\n({node_type})"
+            
+            # 根据节点类型选择形状
+            if isinstance(node, ConditionNode):
+                lines.append(f'    {name}["{label}"]:::condition')
+            elif isinstance(node, ParallelNode):
+                lines.append(f'    {name}["{label}"]:::parallel')
+            elif isinstance(node, AgentNode):
+                lines.append(f'    {name}["{label}"]:::agent')
+            elif isinstance(node, FunctionNode):
+                lines.append(f'    {name}["{label}"]:::function')
+            else:
+                lines.append(f'    {name}["{label}"]')
+            
+            # 如果有执行状态，记录用于后续渲染
+            if show_status and hasattr(self, '_history'):
+                node_styles[name] = node.status.value
+        
+        lines.append("    %% Edges")
+        for edge in self._edges:
+            label_part = f"|{edge.label}|" if edge.label else ""
+            condition_part = ""
+            if edge.condition:
+                condition_part = " -.-> "
+            else:
+                condition_part = " --> "
+            lines.append(f"    {edge.source}{condition_part}{label_part}{edge.target}")
+        
+        # 添加样式定义
+        lines.append("")
+        lines.append("    classDef agent fill:#e1f5fe,stroke:#01579b,stroke-width:2px;")
+        lines.append("    classDef condition fill:#fff3e0,stroke:#e65100,stroke-width:2px,stroke-dasharray: 5, 5;")
+        lines.append("    classDef parallel fill:#f3e5f5,stroke:#4a148c,stroke-width:2px;")
+        lines.append("    classDef function fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px;")
+        lines.append("    classDef completed fill:#c8e6c9,stroke:#2e7d32;")
+        lines.append("    classDef failed fill:#ffcdd2,stroke:#c62828;")
+        lines.append("    classDef running fill:#fff9c4,stroke:#fbc02d;")
+        
+        # 如果有状态，添加动态类
+        if show_status:
+            for name, status in node_styles.items():
+                if status in ("completed", "failed", "running"):
+                    lines.append(f"    class {name} {status};")
+        
+        return "\n".join(lines)
+
+    def to_graphviz(self, direction: str = "TB", show_status: bool = False) -> str:
+        """导出为 GraphViz DOT 格式
+        
+        Args:
+            direction: 流向 (TB=上下, LR=左右, RL=右左, BT=下上)
+            show_status: 是否显示节点状态
+            
+        Returns:
+            DOT 格式字符串
+        """
+        lines = [
+            f"digraph {self.name} {{",
+            f"    rankdir={direction};",
+            "    node [fontname=\"Arial\", fontsize=10];",
+            "    edge [fontname=\"Arial\", fontsize=8];",
+            ""
+        ]
+        
+        # 节点定义
+        for name, node in self._nodes.items():
+            node_type = type(node).__name__
+            label = f"{name}\\n({node_type})"
+            
+            # 根据类型选择形状和颜色
+            if isinstance(node, ConditionNode):
+                lines.append(f'    "{name}" [label="{label}", shape=diamond, style=filled, fillcolor="#fff3e0", color="#e65100"];')
+            elif isinstance(node, ParallelNode):
+                lines.append(f'    "{name}" [label="{label}", shape=box3d, style=filled, fillcolor="#f3e5f5", color="#4a148c"];')
+            elif isinstance(node, AgentNode):
+                lines.append(f'    "{name}" [label="{label}", shape=ellipse, style=filled, fillcolor="#e1f5fe", color="#01579b"];')
+            elif isinstance(node, FunctionNode):
+                lines.append(f'    "{name}" [label="{label}", shape=rect, style=filled, fillcolor="#e8f5e9", color="#1b5e20"];')
+            else:
+                lines.append(f'    "{name}" [label="{label}", shape=ellipse];')
+        
+        lines.append("")
+        
+        # 边定义
+        for edge in self._edges:
+            label = f' [label="{edge.label}"]' if edge.label else ""
+            style = ' [style=dashed]' if edge.condition else ""
+            lines.append(f'    "{edge.source}" -> "{edge.target}"{label}{style};')
+        
+        lines.append("}")
+        return "\n".join(lines)
+
+    def export_visualization(self, filepath: str, format: str = "mermaid") -> bool:
+        """导出可视化到文件
+        
+        Args:
+            filepath: 输出文件路径
+            format: 格式 (mermaid, graphviz, json)
+            
+        Returns:
+            是否成功
+        """
+        try:
+            import os
+            os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+            
+            if format == "mermaid":
+                content = self.to_mermaid()
+            elif format == "graphviz" or format == "dot":
+                content = self.to_graphviz()
+            elif format == "json":
+                content = json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
+            else:
+                raise ValueError(f"Unsupported format: {format}")
+            
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(content)
+            return True
+        except Exception as e:
+            print(f"[ERROR] Export visualization failed: {e}")
+            return False
+
+    def to_dict(self) -> Dict[str, Any]:
+        """导出图结构为字典"""
+        return {
+            "name": self.name,
+            "nodes": {
+                name: {
+                    "type": type(node).__name__,
+                    "config": getattr(node, 'config', {}),
+                }
+                for name, node in self._nodes.items()
+            },
+            "edges": [
+                {
+                    "source": edge.source,
+                    "target": edge.target,
+                    "label": edge.label,
+                    "has_condition": edge.condition is not None
+                }
+                for edge in self._edges
+            ],
+            "entry_nodes": list(self._entry_nodes),
+            "exit_nodes": list(self._exit_nodes),
+            "cycles": self.detect_cycles(),
+            "is_dag": not self.has_cycles()
+        }
     
     def get_execution_summary(self) -> Dict[str, Any]:
         """获取执行摘要"""
