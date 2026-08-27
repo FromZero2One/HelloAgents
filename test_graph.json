@@ -1,0 +1,40 @@
+{
+  "name": "test_dag",
+  "nodes": {
+    "a": {
+      "type": "FunctionNode",
+      "config": {}
+    },
+    "b": {
+      "type": "FunctionNode",
+      "config": {}
+    },
+    "c": {
+      "type": "FunctionNode",
+      "config": {}
+    }
+  },
+  "edges": [
+    {
+      "source": "a",
+      "target": "b",
+      "label": "",
+      "has_condition": false
+    },
+    {
+      "source": "a",
+      "target": "c",
+      "label": "",
+      "has_condition": false
+    }
+  ],
+  "entry_nodes": [
+    "a"
+  ],
+  "exit_nodes": [
+    "c",
+    "b"
+  ],
+  "cycles": [],
+  "is_dag": true
+}

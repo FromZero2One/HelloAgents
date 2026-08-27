@@ -1,0 +1,12 @@
+digraph test_dag {
+    rankdir=TB;
+    node [fontname="Arial", fontsize=10];
+    edge [fontname="Arial", fontsize=8];
+
+    "a" [label="a\n(FunctionNode)", shape=rect, style=filled, fillcolor="#e8f5e9", color="#1b5e20"];
+    "b" [label="b\n(FunctionNode)", shape=rect, style=filled, fillcolor="#e8f5e9", color="#1b5e20"];
+    "c" [label="c\n(FunctionNode)", shape=rect, style=filled, fillcolor="#e8f5e9", color="#1b5e20"];
+
+    "a" -> "b";
+    "a" -> "c";
+}

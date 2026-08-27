@@ -1,0 +1,16 @@
+graph TD
+    %% Nodes
+    a["a\n(FunctionNode)"]:::function
+    b["b\n(FunctionNode)"]:::function
+    c["c\n(FunctionNode)"]:::function
+    %% Edges
+    a --> b
+    a --> c
+
+    classDef agent fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef condition fill:#fff3e0,stroke:#e65100,stroke-width:2px,stroke-dasharray: 5, 5;
+    classDef parallel fill:#f3e5f5,stroke:#4a148c,stroke-width:2px;
+    classDef function fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px;
+    classDef completed fill:#c8e6c9,stroke:#2e7d32;
+    classDef failed fill:#ffcdd2,stroke:#c62828;
+    classDef running fill:#fff9c4,stroke:#fbc02d;
