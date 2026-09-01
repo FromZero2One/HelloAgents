@@ -7,7 +7,7 @@
 - 支持多个 MCP 服务器连接
 """
 
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Set
 from .plugins import AgentPlugin, PluginContext
 import asyncio
 import json
@@ -16,6 +16,165 @@ from dataclasses import dataclass, field
 from enum import Enum
 from ..tools.circuit_breaker import CircuitBreaker
 from ..tools.errors import ToolErrorCode
+
+
+class MCPClient:
+    """MCP 客户端 - 连接单个 MCP 服务器"""
+    
+    def __init__(self, server_name: str, command: List[str], env: Optional[Dict[str, str]] = None):
+        self.server_name = server_name
+        self.command = command
+        self.env = env or {}
+        self._process: Optional[asyncio.subprocess.Process] = None
+        self._request_id = 0
+        self._pending_requests: Dict[int, asyncio.Future] = {}
+        self._tools: List[Dict[str, Any]] = []
+        self._initialized = False
+    
+    async def connect(self) -> bool:
+        """连接到 MCP 服务器"""
+        try:
+            # 启动服务器进程
+            self._process = await asyncio.create_subprocess_exec(
+                *self.command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**import_os_environ(), **self.env}
+            )
+            
+            # 启动读取循环
+            asyncio.create_task(self._read_loop())
+            
+            # 发送初始化请求
+            init_result = await self._send_request("initialize", {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "clientInfo": {"name": "hello-agents", "version": "1.0.0"}
+            })
+            
+            if init_result:
+                self._initialized = True
+                # 列出工具
+                await self.list_tools()
+                return True
+            return False
+            
+        except Exception as e:
+            print(f"❌ MCP 连接失败 ({self.server_name}): {e}")
+            return False
+    
+    async def _read_loop(self):
+        """读取服务器响应循环"""
+        if not self._process or not self._process.stdout:
+            return
+            
+        async for line in self._process.stdout:
+            line = line.decode().strip()
+            if not line:
+                continue
+            try:
+                response = json.loads(line)
+                await self._handle_response(response)
+            except json.JSONDecodeError:
+                pass
+    
+    async def _handle_response(self, response: Dict[str, Any]):
+        """处理服务器响应"""
+        # 处理请求响应
+        if "id" in response and response["id"] in self._pending_requests:
+            future = self._pending_requests.pop(response["id"])
+            if "error" in response:
+                future.set_exception(Exception(response["error"].get("message", "Unknown error")))
+            else:
+                future.set_result(response.get("result"))
+        
+        # 处理通知
+        elif "method" in response:
+            method = response["method"]
+            if method == "notifications/tools/list_changed":
+                await self.list_tools()
+    
+    async def _send_request(self, method: str, params: Optional[Dict] = None) -> Optional[Dict]:
+        """发送 JSON-RPC 请求"""
+        if not self._process or not self._process.stdin:
+            return None
+        
+        self._request_id += 1
+        request_id = self._request_id
+        
+        request = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params or {}
+        }
+        
+        future = asyncio.Future()
+        self._pending_requests[request_id] = future
+        
+        try:
+            request_line = json.dumps(request) + "\n"
+            self._process.stdin.write(request_line.encode())
+            await self._process.stdin.drain()
+            
+            # 等待响应（带超时）
+            result = await asyncio.wait_for(future, timeout=30.0)
+            return result
+        except asyncio.TimeoutError:
+            self._pending_requests.pop(request_id, None)
+            print(f"⚠️ MCP 请求超时 ({self.server_name}): {method}")
+            return None
+        except Exception as e:
+            self._pending_requests.pop(request_id, None)
+            print(f"❌ MCP 请求失败 ({self.server_name}): {e}")
+            return None
+    
+    async def list_tools(self) -> List[Dict[str, Any]]:
+        """获取可用工具列表"""
+        result = await self._send_request("tools/list")
+        if result and "tools" in result:
+            self._tools = result["tools"]
+            # 添加服务器前缀避免冲突
+            for tool in self._tools:
+                tool["_mcp_server"] = self.server_name
+        return self._tools
+    
+    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
+        """调用工具"""
+        # 移除服务器前缀（如果有）
+        original_name = name
+        if name.startswith(f"{self.server_name}__"):
+            original_name = name[len(f"{self.server_name}__"):]
+        
+        result = await self._send_request("tools/call", {
+            "name": original_name,
+            "arguments": arguments
+        })
+        
+        if result:
+            # 标准化返回格式
+            if isinstance(result, dict) and "content" in result:
+                # 处理 MCP 标准响应格式
+                content = result["content"]
+                if isinstance(content, list):
+                    return "\n".join(
+                        item.get("text", str(item)) 
+                        for item in content 
+                        if item.get("type") == "text"
+                    )
+                return str(content)
+            return str(result)
+        
+        return f"❌ MCP 工具调用失败: {name}"
+    
+    async def disconnect(self):
+        """断开连接"""
+        if self._process:
+            self._process.terminate()
+            await self._process.wait()
+            self._process = None
+        self._initialized = False
 
 
 class ConnectionState(Enum):
@@ -593,3 +752,45 @@ class MCPTool:
                 error_message=str(e),
                 stats={"time_ms": elapsed}
             )
+
+
+class PooledMCPTool(MCPTool):
+    """MCP 工具包装器（连接池版）- 每次调用从连接池获取连接"""
+    
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        parameters: List,
+        pool: MCPConnectionPool,
+        original_name: str
+    ):
+        self.name = name
+        self.description = description
+        self.parameters = parameters
+        self.pool = pool
+        self.original_name = original_name
+        self._expandable = False
+        self.mcp_client = None  # 不使用固定客户端，改用连接池
+    
+    async def arun(self, arguments: Dict[str, Any]) -> str:
+        """异步运行（从连接池获取连接）"""
+        client = await self.pool.acquire()
+        if not client:
+            return f"❌ MCP 连接池无可用连接 ({self.pool.config.name})"
+        try:
+            return await client.call_tool(self.original_name, arguments)
+        except Exception as e:
+            return f"❌ MCP 工具调用失败: {e}"
+        finally:
+            await self.pool.release(client)
+    
+    def run(self, arguments: Dict[str, Any]) -> str:
+        """同步运行（不推荐，建议使用异步）"""
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        return loop.run_until_complete(self.arun(arguments))

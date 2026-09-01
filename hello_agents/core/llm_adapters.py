@@ -75,10 +75,46 @@ class BaseLLMAdapter(ABC):
         pass
 
     def _is_thinking_model(self, model_name: str) -> bool:
-        """判断是否为thinking model"""
-        thinking_keywords = ["reasoner", "o1", "o3", "thinking"]
+        """判断是否为thinking model
+
+        支持识别的推理模型:
+        - OpenAI: o1, o3 系列
+        - DeepSeek: deepseek-reasoner, deepseek-r1 等
+        - Qwen: qwq, qwen3 (部分为推理模型)
+        - 其他含 'thinking' 关键字的模型
+        """
+        thinking_keywords = [
+            "reasoner", "thinking",
+            "o1", "o3",
+            "qwq", "qwen3",
+            "deepseek-r",
+        ]
         model_lower = model_name.lower()
         return any(keyword in model_lower for keyword in thinking_keywords)
+
+    def _extract_reasoning(self, *sources: Any) -> Optional[str]:
+        """从多个候选对象中提取推理过程文本。
+
+        不同 provider 使用的字段名不同:
+        - OpenAI o1 / DeepSeek reasoner: ``reasoning_content``
+        - Ollama (qwen3.5 / deepseek-r1 等): ``reasoning``
+        - 其他变体: ``reasoning_text``
+
+        Args:
+            *sources: 按优先级排序的可选对象（message / choice / delta 等）。
+
+        Returns:
+            找到的第一个非空字符串，否则 None。
+        """
+        candidate_keys = ("reasoning_content", "reasoning", "reasoning_text")
+        for source in sources:
+            if source is None:
+                continue
+            for key in candidate_keys:
+                value = getattr(source, key, None)
+                if value:
+                    return value
+        return None
 
 
 class OpenAIAdapter(BaseLLMAdapter):
@@ -130,15 +166,10 @@ class OpenAIAdapter(BaseLLMAdapter):
             choice = response.choices[0]
             content = choice.message.content or ""
             reasoning_content = None
-            
-            # Thinking model特殊处理
+
+            # Thinking model特殊处理（兼容 OpenAI reasoning_content / Ollama reasoning）
             if self._is_thinking_model(self.model):
-                # OpenAI o1系列：reasoning_content在message中
-                if hasattr(choice.message, 'reasoning_content'):
-                    reasoning_content = choice.message.reasoning_content
-                # DeepSeek reasoner：可能在其他字段
-                elif hasattr(choice, 'reasoning_content'):
-                    reasoning_content = choice.reasoning_content
+                reasoning_content = self._extract_reasoning(choice.message, choice)
             
             # 提取usage信息
             usage = {}
@@ -190,9 +221,9 @@ class OpenAIAdapter(BaseLLMAdapter):
                             collected_content.append(content)
                             yield content
 
-                        # Thinking model的推理过程
+                        # Thinking model的推理过程（兼容 reasoning_content / reasoning）
                         if self._is_thinking_model(self.model):
-                            reasoning_delta = getattr(delta, "reasoning_content", None)
+                            reasoning_delta = self._extract_reasoning(delta)
                             if reasoning_delta:
                                 if reasoning_content is None:
                                     reasoning_content = ""
@@ -249,9 +280,9 @@ class OpenAIAdapter(BaseLLMAdapter):
                             collected_content.append(content)
                             yield content
 
-                        # Thinking model的推理过程
+                        # Thinking model的推理过程（兼容 reasoning_content / reasoning）
                         if self._is_thinking_model(self.model):
-                            reasoning_delta = getattr(delta, "reasoning_content", None)
+                            reasoning_delta = self._extract_reasoning(delta)
                             if reasoning_delta:
                                 if reasoning_content is None:
                                     reasoning_content = ""

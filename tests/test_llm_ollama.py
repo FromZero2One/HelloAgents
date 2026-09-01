@@ -1,189 +1,172 @@
-"""测试 HelloAgentsLLM 与本地 Ollama 模型的集成"""
+"""测试 HelloAgentsLLM 与本地 Ollama 模型的真实集成（非 mock）
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+环境要求：
+- 本地 Ollama 服务运行在 http://localhost:11434
+- 已拉取模型（默认 qwen3.5:latest，从 .env 的 LLM_MODEL_ID 读取）
+
+覆盖范围：
+  1. test_ollama_invoke_basic      - 同步非流式
+  2. test_ollama_invoke_with_tools - Function Calling
+  3. test_ollama_stream_invoke     - 同步流式
+  4. test_ollama_ainvoke           - 异步非流式
+
+说明: qwen3.5 是推理模型，会先输出 thinking 再给答案，
+      所有测试统一 max_tokens 预算 + 极简 prompt，控制单次 5-15s。
+"""
+
+import asyncio
+import os
+import sys
+import time
+from pathlib import Path
 
 import pytest
 
+# 把项目根加入 path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# 清除代理环境变量（本地 Ollama 不需要代理）
+for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+           "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
+    os.environ.pop(_k, None)
+
+# 手动加载 .env（LLM_MODEL_ID 等配置）
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env")
+
 from hello_agents.core.llm import HelloAgentsLLM
-from hello_agents.core.llm_adapters import OpenAIAdapter
+
+# 本地 Ollama OpenAI 兼容端点
+OLLAMA_BASE_URL = "http://localhost:11434/v1"
+# 推理模型 thinking 占大头，需要给足 token 预算
+MAX_TOKENS = 32 * 1024
 
 
-def _openai_tool_response():
-    """创建 OpenAI API 响应的 mock 对象（非流式，无 tool calls）"""
-    return SimpleNamespace(
-        model="test-model",
-        usage=SimpleNamespace(
-            prompt_tokens=10,
-            completion_tokens=5,
-            total_tokens=15,
-        ),
-        choices=[
-            SimpleNamespace(
-                message=SimpleNamespace(
-                    content="结果: 5",
-                    tool_calls=None,
-                )
-            )
-        ],
-    )
-
-
-def _openai_tool_call_response():
-    """创建包含 tool calls 的 OpenAI API 响应 mock"""
-    return SimpleNamespace(
-        model="test-model",
-        usage=SimpleNamespace(
-            prompt_tokens=10,
-            completion_tokens=5,
-            total_tokens=15,
-        ),
-        choices=[
-            SimpleNamespace(
-                message=SimpleNamespace(
-                    content="",
-                    tool_calls=[
-                        SimpleNamespace(
-                            id="call_1",
-                            function=SimpleNamespace(
-                                name="calculate",
-                                arguments='{"expression": "2+3"}',
-                            ),
-                        )
-                    ],
-                )
-            )
-        ],
-    )
+@pytest.fixture()
+def llm():
+    """创建指向本地 Ollama 的 LLM 实例（模型从 .env 的 LLM_MODEL_ID 读取）"""
+    return HelloAgentsLLM(base_url=OLLAMA_BASE_URL, timeout=120)
 
 
 class TestLLMOllama:
-    """测试 Ollama 本地模型集成 - 使用 OpenAIAdapter 配合 http://localhost:11434/v1"""
+    """测试本地 Ollama 真实集成（localhost:11434）"""
 
-    @pytest.fixture(autouse=True)
-    def setup_mock_client(self, request):
-        """每个 test 自动设置 mock OpenAI client"""
-        # 创建完整的 mock 链路：openai.OpenAI -> .chat -> .completions -> .create
-        mock_openai_instance = MagicMock()
-        
-        # 将 test 方法名传递给 fixture，以便根据需要设置不同的返回值
-        test_name = request.node.name
-        
-        # mock non-streaming 响应（用于 invoke、ainvoke）
-        # 默认返回无 tool calls 的响应
-        mock_response_no_tools = _openai_tool_response()
-        mock_response_with_tools = _openai_tool_call_response()
-        
-        # 设置 create 的 side_effect 根据 test 名称决定返回什么
-        if "invoke_with_tools" in test_name:
-            # 需要 tool calling 的 test 返回有 tool calls 的响应
-            mock_openai_instance.chat.completions.create.return_value = mock_response_with_tools
-        else:
-            # 其他 test 返回无 tool calls 的响应
-            mock_openai_instance.chat.completions.create.return_value = mock_response_no_tools
-        
-        # mock streaming 响应 - 使用生成器
-        def streaming_create_side_effect(**kwargs):
-            if kwargs.get("stream", False):
-                # 返回一个生成器，模拟 stream=True 的行为
-                chunks = ["你好", "", "世界"]
-                
-                def chunk_generator():
-                    for chunk_text in chunks:
-                        yield SimpleNamespace(
-                            choices=[SimpleNamespace(delta=SimpleNamespace(content=chunk_text))],
-                            usage=None,
-                        )
-                    # 最后 yield usage
-                    yield SimpleNamespace(
-                        choices=[],
-                        usage=SimpleNamespace(
-                            prompt_tokens=3,
-                            completion_tokens=2,
-                            total_tokens=5,
-                        ),
-                    )
-                
-                return chunk_generator()
-            # non-streaming 返回上面已设置的响应
-            return mock_openai_instance.chat.completions.create.return_value
-        
-        mock_openai_instance.chat.completions.create.side_effect = streaming_create_side_effect
-        
-        # patch openai.OpenAI 以返回我们的 mock
-        # OpenAIAdapter.create_client 调用 openai.Open(api_key=..., base_url=..., timeout=...)
-        patch_target = "openai.OpenAI"
-        self._patch_openai = patch(patch_target, return_value=mock_openai_instance)
-        self._patch_openai.start()
-        
-        # 确保 adapter 使用正确的 base_url
-        with patch.dict("os.environ", {
-            "LLM_API_KEY": "ollama-key",
-            "LLM_BASE_URL": "http://localhost:11434/v1",
-            "LLM_MODEL_ID": "sam860/lucy:1.7b",
-        }):
-            # 创建 LLM 实例
-            self.llm = HelloAgentsLLM()
-            
-            # 手动替换 adapter 的 client，确保是我们的 mock
-            # OpenAIAdapter 创建的 client 正是 openai.OpenAI() 实例
-            # 我们已经 patch 了 openai.OpenAI，所以 adapter._client 会是 mock
-            if hasattr(self.llm._adapter, '_client'):
-                self.llm._adapter._client = mock_openai_instance
-            
-            yield
-            
-        # 清理 patch
-        self._patch_openai.stop()
+    def test_ollama_invoke_basic(self, llm):
+        """Ollama 基本非流式调用"""
+        t0 = time.time()
+        response = llm.invoke(
+            [{"role": "user", "content": "1+1=?"}],
+            temperature=0.3, max_tokens=MAX_TOKENS
+        )
+        elapsed = time.time() - t0
 
-    def test_ollama_invoke_basic(self):
-        """测试 Ollama 基本非流式调用"""
-        messages = [{"role": "user", "content": "你好"}]
-        
-        response = self.llm.invoke(messages)
-        
-        assert response.content == "结果: 5"
-        assert response.model == "sam860/lucy:1.7b"
-        assert response.usage["total_tokens"] == 15
+        print(f"[耗时]     {elapsed:.2f}s")
+        print(f"[content]  {response.content!r}")
+        print(f"[model]    {response.model}")
+        print(f"[usage]    {response.usage}")
+        print(f"[latency]  {response.latency_ms} ms")
+        if response.reasoning_content:
+            print(f"[reasoning] ({len(response.reasoning_content)} chars)")
 
-    def test_ollama_invoke_with_tools(self):
-        """测试 Ollama 的 Function Calling"""
-        messages = [{"role": "user", "content": "计算 2+3"}]
+        assert response.content, "content 应非空"
+        assert response.model == llm.model, "应返回配置的模型名"
+        assert response.usage["total_tokens"] > 0, "应返回 token 用量"
+        print(f"\n[PASS] test_ollama_invoke_basic ({elapsed:.1f}s)")
+
+    def test_ollama_invoke_with_tools(self, llm):
+        """Ollama 的 Function Calling"""
         tools = [
             {
                 "type": "function",
                 "function": {
-                    "name": "calculate",
-                    "description": "计算",
+                    "name": "get_weather",
+                    "description": "获取指定城市的天气",
                     "parameters": {
                         "type": "object",
-                        "properties": {"expression": {"type": "string"}},
+                        "properties": {"city": {"type": "string", "description": "城市名"}},
+                        "required": ["city"],
                     },
                 },
             }
         ]
 
-        response = self.llm.invoke_with_tools(messages, tools)
+        t0 = time.time()
+        response = llm.invoke_with_tools(
+            [{"role": "user", "content": "查询北京的天气"}],
+            tools,
+            tool_choice="auto",
+            temperature=0.3, max_tokens=MAX_TOKENS
+        )
+        elapsed = time.time() - t0
 
-        assert response.tool_calls[0].name == "calculate"
-        assert response.tool_calls[0].arguments == '{"expression": "2+3"}'
+        print(f"[耗时]       {elapsed:.2f}s")
+        print(f"[content]    {response.content!r}")
+        print(f"[tool_calls] {len(response.tool_calls)} 个")
+        for i, tc in enumerate(response.tool_calls):
+            print(f"  [{i}] name={tc.name}, args={tc.arguments}")
+        print(f"[usage]      {response.usage}")
 
-    def test_ollama_stream_invoke(self):
-        """测试 Ollama 流式调用"""
-        # 流式调用会迭代 chunks，提取 content
-        chunks = list(self.llm.stream_invoke([{"role": "user", "content": "hi"}]))
-        
-        # 应该能够提取出一些内容（取决于 mock 返回的内容）
-        # 核心验证是：stream_invoke 不会抛出异常，并返回一个 list
-        assert isinstance(chunks, list)
+        # 真实模型行为不确定：可能调用工具，也可能直接回答；
+        # 但至少应返回有效响应（Function Calling 链路无异常）
+        assert response.content or response.tool_calls, "应返回文本或工具调用"
+        for tc in response.tool_calls:
+            assert tc.name == "get_weather", "工具名应匹配"
+            assert '"city"' in tc.arguments, "参数应包含 city"
+        print(f"\n[PASS] test_ollama_invoke_with_tools ({elapsed:.1f}s)")
 
-    def test_ollama_ainvoke(self):
-        """测试 Ollama 异步调用"""
-        import asyncio
-        
-        messages = [{"role": "user", "content": "hi"}]
-        response = asyncio.run(self.llm.ainvoke(messages))
-        
-        assert response.content == "结果: 5"
-        assert response.model == "sam860/lucy:1.7b"
-        assert response.usage["total_tokens"] == 15
+    def test_ollama_stream_invoke(self, llm):
+        """Ollama 流式调用"""
+        t0 = time.time()
+        chunks = list(llm.stream_invoke(
+            [{"role": "user", "content": "说hi"}],
+            temperature=0.3, max_tokens=MAX_TOKENS
+        ))
+        elapsed = time.time() - t0
+
+        full_text = "".join(chunks)
+        print(f"[耗时]     {elapsed:.2f}s")
+        print(f"[chunk 数] {len(chunks)}")
+        print(f"[完整文本] {full_text!r}")
+
+        assert len(chunks) > 0, "应至少收到一个 chunk"
+        assert full_text.strip(), "流式文本应非空"
+        print(f"\n[PASS] test_ollama_stream_invoke ({elapsed:.1f}s)")
+
+    @pytest.mark.asyncio
+    async def test_ollama_ainvoke(self, llm):
+        """Ollama 异步调用"""
+        t0 = time.time()
+        response = await llm.ainvoke(
+            [{"role": "user", "content": "1+1=?"}],
+            temperature=0.3, max_tokens=MAX_TOKENS
+        )
+        elapsed = time.time() - t0
+
+        print(f"[耗时]    {elapsed:.2f}s")
+        print(f"[content] {response.content!r}")
+        print(f"[model]   {response.model}")
+        print(f"[usage]   {response.usage}")
+
+        assert response.content, "content 应非空"
+        assert response.model == llm.model
+        print(f"\n[PASS] test_ollama_ainvoke ({elapsed:.1f}s)")
+
+
+def main():
+    """直接运行入口（无需 pytest）"""
+    print("=" * 60)
+    print("  HelloAgentsLLM x Ollama 集成测试（真实调用）")
+    print(f"  base_url: {OLLAMA_BASE_URL}")
+    print("=" * 60)
+
+    llm = HelloAgentsLLM(base_url=OLLAMA_BASE_URL, timeout=120)
+    test = TestLLMOllama()
+
+    test.test_ollama_invoke_basic(llm)
+    test.test_ollama_invoke_with_tools(llm)
+    test.test_ollama_stream_invoke(llm)
+    asyncio.run(test.test_ollama_ainvoke(llm))
+
+
+if __name__ == "__main__":
+    main()

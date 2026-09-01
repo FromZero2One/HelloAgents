@@ -8,7 +8,7 @@ from ..core.llm import HelloAgentsLLM
 from ..core.config import Config
 from ..core.message import Message
 from ..core.streaming import StreamEvent, StreamEventType
-from ..core.lifecycle import LifecycleHook
+from ..core.lifecycle import AgentEvent, EventType, LifecycleHook
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolRegistry
