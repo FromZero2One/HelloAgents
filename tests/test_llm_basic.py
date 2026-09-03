@@ -30,10 +30,10 @@ for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
 
 # 手动加载 .env
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from hello_agents import HelloAgentsLLM
-
 
 # 测试用 prompt —— qwen3.5 是推理模型，会先 thinking
 # 不加 system prompt（容易触发大段思考），max_tokens 给足
@@ -43,13 +43,35 @@ TOOL_PROMPT = [{"role": "user", "content": "北京天气？"}]
 ASYNC_PROMPT = [{"role": "user", "content": "1+1=?"}]
 ASTREAM_PROMPT = [{"role": "user", "content": "1+2=?"}]
 
-MAX_TOKENS = 32*1024  # 推理模型 thinking 占大头，需要给足预算
+MAX_TOKENS = 32 * 1024  # 推理模型 thinking 占大头，需要给足预算
 
 
 def banner(title: str):
     print("\n" + "=" * 60)
     print(f"  {title}")
     print("=" * 60)
+
+
+def test_0_init():
+    from openai import OpenAI
+    """
+    最基本的大模型调用
+    """
+
+    # 创建客户端
+    _client = OpenAI(
+        api_key='ollama',
+        base_url='http://127.0.0.1:11434/v1',
+    )
+    # 调用
+    response = _client.chat.completions.create(
+        model="sam860/lucy:1.7b",
+        messages=[{"role": "user", "content": "hello"}]
+    )
+    # 处理结果
+    choice = response.choices[0]
+    content = choice.message.content or ""
+    print(f"LLM 回复：  {content}")
 
 
 def test_1_invoke():
